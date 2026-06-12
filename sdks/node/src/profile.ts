@@ -80,6 +80,43 @@ export class FingerprintLibrary {
   }
 }
 
+/**
+ * Normalise a profile config's spoofed Chrome version to `chromiumVersion`
+ * (e.g. "149.0.7827.103") so it always matches the running engine — bumps
+ * `navigator.user_agent` (Chrome/<major>.0.0.0) and the chrome-version fields
+ * in `client_hints` (brand_version / brand_full_version / chrome_build /
+ * chrome_patch). Leaves platform_version, architecture, grease, etc. intact.
+ * Mutates `config` in place. This is the SDK equivalent of the launcher's
+ * post-update profile migration.
+ */
+export function applyEngineVersion(config: Record<string, unknown>, chromiumVersion: string): void {
+  const parts = chromiumVersion.split(".");
+  if (parts.length !== 4) return;
+  const major = parts[0];
+  const build = parseInt(parts[2], 10);
+  const patch = parseInt(parts[3], 10);
+
+  const nav = config["navigator"] as Record<string, unknown> | undefined;
+  const ua = nav?.["user_agent"];
+  if (nav && typeof ua === "string") {
+    const idx = ua.indexOf("Chrome/");
+    if (idx >= 0) {
+      const rest = ua.slice(idx + 7);
+      const end = rest.indexOf(" ");
+      const tail = end >= 0 ? rest.slice(end) : "";
+      nav["user_agent"] = `${ua.slice(0, idx)}Chrome/${major}.0.0.0${tail}`;
+    }
+  }
+
+  const ch = config["client_hints"] as Record<string, unknown> | undefined;
+  if (ch && typeof ch === "object") {
+    ch["brand_version"] = major;
+    ch["brand_full_version"] = chromiumVersion;
+    if (Number.isFinite(build)) ch["chrome_build"] = build;
+    if (Number.isFinite(patch)) ch["chrome_patch"] = patch;
+  }
+}
+
 /** Per-profile state (cookies / IndexedDB / cache) — preserved across
  *  launches. Defaults to `./shardx-profiles/<id>/` next to the running
  *  script. Override per launch with `userDataDir` or per SDK with

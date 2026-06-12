@@ -26,7 +26,7 @@ from .auto_resolve import has_auto_fields, resolve_auto_fields
 from .geo import GeoInfo, geo_check_via
 from .profile import Profile, user_data_dir as _user_data_dir
 from .proxy import ParsedProxy, parse_proxy, probe_udp
-from .runtime import Runtime
+from .runtime import Runtime, apply_engine_version
 from .screen import apply_screen_strategy, default_mode_for
 
 
@@ -116,6 +116,9 @@ class Browser:
         udd_base = Path(user_data_dir).resolve() if user_data_dir else None
         udd = _user_data_dir(self.runtime, profile.id, base=udd_base)
         print(f"[shardx] profile '{profile.id}' → {udd}", flush=True)
+        # Keep the spoofed Chrome version coherent with the installed engine,
+        # regardless of where the profile config came from (library / file / dict).
+        apply_engine_version(profile.config, self.runtime.chromium_version)
         fp_file = udd / "fingerprint.json"
         fp_file.write_text(json.dumps(profile.config))
 

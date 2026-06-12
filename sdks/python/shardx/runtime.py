@@ -19,7 +19,11 @@ from typing import Callable, Optional
 import httpx
 
 PUB_BASE = "https://pub-e57a7c60f6934eb09a6600bf2fc59cdc.r2.dev"
-CHROMIUM_VERSION = "148.0.7778.216"
+CHROMIUM_VERSION = "149.0.7827.103"
+# Version manifest (GitHub raw) — one tiny GET tells us every archive's current
+# etag, so we never poll R2/S3 (no per-archive HEAD). Updated archives are then
+# pulled from PUB_BASE only when their etag changed.
+MANIFEST_URL = "https://raw.githubusercontent.com/ProxyShard/ShardBrowser/main/runtime.json"
 
 # Default cache: ~/Library/Application Support/shardx-sdk (mac),
 # %LOCALAPPDATA%\shardx-sdk (win), ~/.cache/shardx-sdk (linux).
@@ -85,6 +89,44 @@ FINGERPRINTS_TOP_DIR = "shardx-fingerprints"
 ProgressCb = Callable[[str, int, int], None]   # (label, received, total)
 
 
+def apply_engine_version(config: dict, chromium_version: str) -> None:
+    """Normalise a profile config's spoofed Chrome version to `chromium_version`
+    (e.g. "149.0.7827.103") so it always matches the running engine — bumps
+    `navigator.user_agent` (Chrome/<major>.0.0.0) and the chrome-version fields
+    in `client_hints` (brand_version / brand_full_version / chrome_build /
+    chrome_patch). Leaves platform_version, architecture, grease, etc. intact.
+    Mutates `config` in place. SDK equivalent of the launcher's post-update
+    profile migration."""
+    parts = chromium_version.split(".")
+    if len(parts) != 4:
+        return
+    major = parts[0]
+    try:
+        build = int(parts[2])
+        patch = int(parts[3])
+    except ValueError:
+        build = patch = None
+
+    nav = config.get("navigator")
+    if isinstance(nav, dict) and isinstance(nav.get("user_agent"), str):
+        ua = nav["user_agent"]
+        idx = ua.find("Chrome/")
+        if idx >= 0:
+            rest = ua[idx + 7:]
+            end = rest.find(" ")
+            tail = rest[end:] if end >= 0 else ""
+            nav["user_agent"] = f"{ua[:idx]}Chrome/{major}.0.0.0{tail}"
+
+    ch = config.get("client_hints")
+    if isinstance(ch, dict):
+        ch["brand_version"] = major
+        ch["brand_full_version"] = chromium_version
+        if build is not None:
+            ch["chrome_build"] = build
+        if patch is not None:
+            ch["chrome_patch"] = patch
+
+
 class Runtime:
     """Owns the cache dir and the install/update lifecycle."""
 
@@ -103,6 +145,9 @@ class Runtime:
         self._profiles_root = Path(profiles_dir).resolve() if profiles_dir else None
         self._progress = progress
         self._spec = host_spec()
+        # Engine chromium version (manifest-driven; set on install()). Used by
+        # launch to normalise profile UA + client_hints to the running engine.
+        self._chromium_version = CHROMIUM_VERSION
         # Set to True after a successful in-process install() so subsequent
         # launches in the same process skip the R2 HEAD round-trip (~1 s
         # over a clean connection).  Cleared by `install(force=True)`.
@@ -134,6 +179,11 @@ class Runtime:
     def installed(self) -> bool:
         return self.binary_path.exists()
 
+    @property
+    def chromium_version(self) -> str:
+        """Engine chromium version (manifest-driven; set on install())."""
+        return self._chromium_version
+
     # ---- manifest ----
 
     def _load_manifest(self) -> dict:
@@ -154,23 +204,31 @@ class Runtime:
         if self._checked_in_process and not force:
             return
         local = self._load_manifest()
-        # Browser
-        need_browser = force or not self.installed or \
-            local.get("browser_etag") != self._head_etag(self._spec.browser.key)
+        manifest = self._fetch_manifest()
+        remote = manifest.get("archives") if isinstance(manifest.get("archives"), dict) else {}
+        # Remember the engine version so launch can normalise profiles to it.
+        self._chromium_version = manifest.get("chromium_version") or CHROMIUM_VERSION
+        # Browser. A None remote (manifest unreachable) must NOT force a
+        # re-download when we're already installed — only a *differing* etag does.
+        need_browser = force or not self.installed
+        if not need_browser:
+            rb = remote.get(self._spec.browser.key)
+            need_browser = rb is not None and local.get("browser_etag") != rb
         if need_browser:
-            etag = self._download_and_extract(self._spec.browser, self.root)
-            local["browser_etag"] = etag
+            local["browser_etag"] = self._download_and_extract(self._spec.browser, self.root)
         # Widevine — only re-pull when browser changed (versions must match).
         if self._spec.widevine and (need_browser or not local.get("widevine_etag")):
-            etag = self._download_and_extract(self._spec.widevine, self.root)
+            local["widevine_etag"] = self._download_and_extract(self._spec.widevine, self.root)
             self._place_widevine()
-            local["widevine_etag"] = etag
         # Fingerprints — additive seed (etag changed → re-extract, never
         # overwrites user-renamed files).
-        fp_remote = self._head_etag(FINGERPRINTS_ARCHIVE.key)
-        if force or local.get("fingerprints_etag") != fp_remote or not any(self.fingerprints_dir.glob("*.json")):
-            self._install_fingerprints(force=force)
-            local["fingerprints_etag"] = fp_remote
+        fp_remote = remote.get(FINGERPRINTS_ARCHIVE.key)
+        need_fp = force or not any(self.fingerprints_dir.glob("*.json")) or \
+            (fp_remote is not None and local.get("fingerprints_etag") != fp_remote)
+        if need_fp:
+            self._install_fingerprints()
+            if fp_remote is not None:
+                local["fingerprints_etag"] = fp_remote
         self._save_manifest(local)
         # Linux/mac archives produced on Windows lose every Unix exec bit;
         # restore +x on every ELF/Mach-O file under the engine tree (not
@@ -180,15 +238,20 @@ class Runtime:
             _fix_unix_exec_bits(self.root)
         self._checked_in_process = True
 
-    def _head_etag(self, key: str) -> Optional[str]:
+    def _fetch_manifest(self) -> dict:
+        """Fetch the version manifest (GitHub raw) — one request that yields
+        every archive's current etag + the chromium version, replacing
+        per-archive HEADs against R2/S3. Returns the parsed manifest, or {}
+        when unreachable."""
         try:
-            with httpx.Client(timeout=8.0) as c:
-                r = c.head(f"{PUB_BASE}/{key}")
+            with httpx.Client(timeout=8.0, follow_redirects=True) as c:
+                r = c.get(MANIFEST_URL)
                 if r.status_code != 200:
-                    return None
-                return r.headers.get("etag", "").strip('"') or None
+                    return {}
+                data = r.json()
+                return data if isinstance(data, dict) else {}
         except Exception:
-            return None
+            return {}
 
     def _download_and_extract(self, arch: Archive, dest: Path) -> str:
         url = f"{PUB_BASE}/{arch.key}"
@@ -237,7 +300,7 @@ class Runtime:
         shutil.move(str(src), str(dst))
         shutil.rmtree(self.root / wrapper_name, ignore_errors=True)
 
-    def _install_fingerprints(self, force: bool) -> None:
+    def _install_fingerprints(self) -> None:
         url = f"{PUB_BASE}/{FINGERPRINTS_ARCHIVE.key}"
         staging = self.fingerprints_dir / ".staging"
         if staging.exists():
@@ -259,14 +322,13 @@ class Runtime:
         with zipfile.ZipFile(tmp) as z:
             z.extractall(staging)
         # Move *.json from the wrapper dir into fingerprints/, additive
-        # (never clobber user-edited files unless force).
+        # Always overwrite bundled templates so engine-version bumps reach
+        # existing libraries; user-added files (other names) are never iterated.
         src_dir = staging / FINGERPRINTS_TOP_DIR
         walk = src_dir if src_dir.exists() else staging
         for p in walk.iterdir():
             if p.suffix == ".json":
-                dst = self.fingerprints_dir / p.name
-                if force or not dst.exists():
-                    shutil.copy(p, dst)
+                shutil.copy(p, self.fingerprints_dir / p.name)
         shutil.rmtree(staging, ignore_errors=True)
 
 

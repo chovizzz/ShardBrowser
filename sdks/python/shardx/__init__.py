@@ -47,7 +47,7 @@ from .host import (
 from .profile import FingerprintLibrary, Profile
 from .proxy import ParsedProxy, parse_proxy, probe_udp
 from .randomize import randomize_hardware, randomize_platform_version
-from .runtime import RUNTIME_DIR, Runtime
+from .runtime import RUNTIME_DIR, Runtime, apply_engine_version
 from .screen import apply_screen_strategy, default_mode_for
 
 
@@ -191,7 +191,7 @@ class ShardX:
 
 __all__ = [
     "ShardX",
-    "Runtime", "RUNTIME_DIR",
+    "Runtime", "RUNTIME_DIR", "apply_engine_version",
     "Profile", "FingerprintLibrary",
     "Browser", "BrowserSession",
     "randomize_hardware", "randomize_platform_version",

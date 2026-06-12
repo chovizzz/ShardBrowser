@@ -14,7 +14,7 @@ import { join } from "node:path";
 
 import { hasAutoFields, resolveAutoFields } from "./autoResolve.js";
 import { geoCheckVia, type GeoInfo } from "./geo.js";
-import { Profile, userDataDir } from "./profile.js";
+import { Profile, userDataDir, applyEngineVersion } from "./profile.js";
 import { parseProxy, probeUdp, proxyToArg, type ParsedProxy } from "./proxy.js";
 import type { Runtime } from "./runtime.js";
 import { applyScreenStrategy, defaultScreenModeFor, type ScreenStrategy } from "./screen.js";
@@ -101,6 +101,9 @@ export class Browser {
     // ---- profile + udd ----------------------------------------------
     const udd = userDataDir(this.runtime, profile.id, opts.userDataDir);
     console.log(`[shardx] profile '${profile.id}' → ${udd}`);
+    // Keep the spoofed Chrome version coherent with the installed engine,
+    // regardless of where the profile config came from (library / file / dict).
+    applyEngineVersion(profile.config, this.runtime.chromiumVersion);
     const fpFile = join(udd, "fingerprint.json");
     writeFileSync(fpFile, JSON.stringify(profile.config));
 

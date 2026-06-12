@@ -12,7 +12,11 @@ import { spawnSync } from "node:child_process";
 import AdmZip from "adm-zip";
 
 export const PUB_BASE = "https://pub-e57a7c60f6934eb09a6600bf2fc59cdc.r2.dev";
-export const CHROMIUM_VERSION = "148.0.7778.216";
+export const CHROMIUM_VERSION = "149.0.7827.103";
+// Version manifest (GitHub raw) — one tiny GET yields every archive's current
+// etag, so we never poll R2/S3 (no per-archive HEAD). Changed archives are then
+// pulled from PUB_BASE.
+export const MANIFEST_URL = "https://raw.githubusercontent.com/ProxyShard/ShardBrowser/main/runtime.json";
 
 export function defaultCacheDir(): string {
   const plat = osPlatform();
@@ -85,6 +89,9 @@ export class Runtime {
    *  skip the R2 HEAD round-trip (~1 s over a clean connection).  Cleared
    *  by `install({force: true})`. */
   private _checkedInProcess = false;
+  /** Engine chromium version from the manifest (fallback to the build-time
+   *  constant). Used by launch to normalise profile UA + client_hints. */
+  private _chromiumVersion: string = CHROMIUM_VERSION;
 
   constructor(opts: { cacheDir?: string; progress?: ProgressCb; profilesDir?: string } = {}) {
     this.root = opts.cacheDir ?? defaultCacheDir();
@@ -110,6 +117,8 @@ export class Runtime {
     return d;
   }
   get installed(): boolean    { return existsSync(this.binaryPath); }
+  /** Engine chromium version (manifest-driven; set on install()). */
+  get chromiumVersion(): string { return this._chromiumVersion; }
 
   // ---- manifest ----
 
@@ -127,23 +136,29 @@ export class Runtime {
     const force = !!opts.force;
     if (this._checkedInProcess && !force) return;
     const local = this.loadManifest();
+    const remote = await this.fetchManifest();
+    // Remember the engine version so launch can normalise profiles to it.
+    this._chromiumVersion = remote.chromiumVersion ?? CHROMIUM_VERSION;
 
-    const remoteBrowser = await this.headEtag(this.spec.browser.key);
-    const needBrowser = force || !this.installed || local.browser_etag !== remoteBrowser;
+    // An undefined remote (manifest unreachable) must NOT force a re-download
+    // when already installed — only a *differing* etag does.
+    let needBrowser = force || !this.installed;
+    if (!needBrowser) {
+      const rb = remote.archives[this.spec.browser.key];
+      needBrowser = rb !== undefined && local.browser_etag !== rb;
+    }
     if (needBrowser) {
-      const etag = await this.downloadAndExtract(this.spec.browser, this.root);
-      local.browser_etag = etag;
+      local.browser_etag = await this.downloadAndExtract(this.spec.browser, this.root);
     }
     if (this.spec.widevine && (needBrowser || !local.widevine_etag)) {
-      const etag = await this.downloadAndExtract(this.spec.widevine, this.root);
+      local.widevine_etag = await this.downloadAndExtract(this.spec.widevine, this.root);
       this.placeWidevine();
-      local.widevine_etag = etag;
     }
-    const remoteFp = await this.headEtag(FINGERPRINTS_ARCHIVE.key);
+    const remoteFp = remote.archives[FINGERPRINTS_ARCHIVE.key];
     const fpDirHasJson = readdirSync(this.fingerprintsDir).some((f) => f.endsWith(".json"));
-    if (force || local.fingerprints_etag !== remoteFp || !fpDirHasJson) {
-      await this.installFingerprints(force);
-      if (remoteFp) local.fingerprints_etag = remoteFp;
+    if (force || !fpDirHasJson || (remoteFp !== undefined && local.fingerprints_etag !== remoteFp)) {
+      await this.installFingerprints();
+      if (remoteFp !== undefined) local.fingerprints_etag = remoteFp;
     }
     this.saveManifest(local);
 
@@ -159,12 +174,19 @@ export class Runtime {
 
   // ---- helpers ----
 
-  private async headEtag(key: string): Promise<string | undefined> {
+  /** Fetch the version manifest (GitHub raw) — one request that yields every
+   *  archive's current etag + the chromium version, replacing per-archive HEADs
+   *  against R2/S3. Empty archives / undefined version when unreachable. */
+  private async fetchManifest(): Promise<{ archives: Record<string, string>; chromiumVersion?: string }> {
     try {
-      const r = await fetch(`${PUB_BASE}/${key}`, { method: "HEAD" });
-      if (!r.ok) return undefined;
-      return r.headers.get("etag")?.replace(/^"|"$/g, "") ?? undefined;
-    } catch { return undefined; }
+      const r = await fetch(MANIFEST_URL);
+      if (!r.ok) return { archives: {} };
+      const data = await r.json() as { archives?: Record<string, string>; chromium_version?: string };
+      return {
+        archives: (data && typeof data.archives === "object" && data.archives) || {},
+        chromiumVersion: typeof data?.chromium_version === "string" ? data.chromium_version : undefined,
+      };
+    } catch { return { archives: {} }; }
   }
 
   private async downloadAndExtract(arch: Archive, dest: string): Promise<string> {
@@ -222,7 +244,7 @@ export class Runtime {
     rmSync(join(this.root, wrapper), { recursive: true, force: true });
   }
 
-  private async installFingerprints(force: boolean): Promise<void> {
+  private async installFingerprints(): Promise<void> {
     const url = `${PUB_BASE}/${FINGERPRINTS_ARCHIVE.key}`;
     const staging = join(this.fingerprintsDir, ".staging");
     if (existsSync(staging)) rmSync(staging, { recursive: true, force: true });
@@ -258,7 +280,9 @@ export class Runtime {
     for (const name of readdirSync(walk)) {
       if (!name.endsWith(".json")) continue;
       const dst = join(this.fingerprintsDir, name);
-      if (force || !existsSync(dst)) copyFileSync(join(walk, name), dst);
+      // Always overwrite bundled templates so engine-version bumps reach
+      // existing libraries; user-added files (other names) are never iterated.
+      copyFileSync(join(walk, name), dst);
     }
     rmSync(staging, { recursive: true, force: true });
   }

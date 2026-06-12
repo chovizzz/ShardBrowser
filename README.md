@@ -7,6 +7,8 @@
 <p align="center">
   <a href="https://pypi.org/project/shardx/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/shardx?style=flat-square&logo=pypi&logoColor=white&label=pypi&color=blue"></a>
   <a href="https://www.npmjs.com/package/@proxyshard/shardx"><img alt="npm version" src="https://img.shields.io/npm/v/@proxyshard/shardx?style=flat-square&logo=npm&logoColor=white&label=npm&color=red"></a>
+  <a href="https://crates.io/crates/shardx"><img alt="crates.io version" src="https://img.shields.io/crates/v/shardx?style=flat-square&logo=rust&logoColor=white&label=crates.io&color=orange"></a>
+  <a href="https://docs.rs/shardx"><img alt="docs.rs" src="https://img.shields.io/docsrs/shardx?style=flat-square&logo=docsdotrs&logoColor=white&label=docs.rs"></a>
 </p>
 
 <p align="center">
@@ -14,6 +16,7 @@
   <a href="https://github.com/ProxyShard/ShardBrowser/commits"><img alt="Last commit" src="https://img.shields.io/github/last-commit/ProxyShard/ShardBrowser?style=flat-square&color=success"></a>
   <a href="https://pypi.org/project/shardx/"><img alt="PyPI downloads" src="https://img.shields.io/pypi/dm/shardx?style=flat-square&logo=pypi&logoColor=white&label=pypi&color=brightgreen"></a>
   <a href="https://www.npmjs.com/package/@proxyshard/shardx"><img alt="npm downloads" src="https://img.shields.io/npm/dt/@proxyshard/shardx?style=flat-square&logo=npm&logoColor=white&label=npm&color=brightgreen"></a>
+  <a href="https://crates.io/crates/shardx"><img alt="crates.io downloads" src="https://img.shields.io/crates/d/shardx?style=flat-square&logo=rust&logoColor=white&label=crates.io&color=brightgreen"></a>
 </p>
 
 A project by the **[ProxyShard](https://proxyshard.com?utm_source=shardx&utm_medium=referral&utm_campaign=shardx-launcher)** team — the
@@ -22,7 +25,7 @@ proxy service with full **SOCKS5 UDP relay** (RFC 1928 §7) and active
 claims to be on actually matches the SYN/ACK shape sites see). ShardX
 is the in-house anti-detect browser stack we built to get the most out
 of those proxies: the launcher manages profiles, binds proxies, and
-ships the patched **Chromium 148** browser that does the actual
+ships the patched **Chromium 149** browser that does the actual
 spoofing at the engine level.
 
 * **Site:**     [https://proxyshard.com](https://proxyshard.com?utm_source=shardx&utm_medium=referral&utm_campaign=shardx-launcher)
@@ -41,7 +44,7 @@ no sync step:
   start / stop profiles and grab a CDP endpoint from any language.
 * **MCP server** — drops into Claude Desktop / Cursor for
   natural-language profile orchestration (HTTP API + browser-over-CDP).
-* **Standalone SDKs** — Python + Node libraries that ship the engine
+* **Standalone SDKs** — Python, Node + Rust libraries that ship the engine
   themselves and need no GUI at all; ideal for scrapers / CI / servers.
 
 Setup for each lives in [Usage](#usage) below.
@@ -114,7 +117,7 @@ across iframes, web workers, devtools and headless inspection.
   proxy's exit IP; host GPS / Wi-Fi is never used.
 * **Network capability** — connection type, downlink, RTT, save-data,
   storage quota, JS heap limit, battery state, media-device counts.
-* **TLS ClientHello** — Chrome-148 cipher + signature-algorithm
+* **TLS ClientHello** — Chrome-149 cipher + signature-algorithm
   selection, extension shuffling, so JA4 / Akamai / Peetprint fingerprints
   match real Chrome.
 * **HTTP-3 over the proxy's UDP relay** — QUIC works end-to-end through
@@ -181,7 +184,7 @@ QUIC handshake completes end-to-end through the SOCKS5 UDP relay;
 every WebRTC probe (UDP / TCP / TLS) passes against Twilio's test
 suite without leaking the host IP.
 
-| browserleaks.com/quic — QUIC `True`, JA4 matches Chrome 148 | networktest.twilio.com — every probe `Pass`               |
+| browserleaks.com/quic — QUIC `True`, JA4 matches Chrome 149 | networktest.twilio.com — every probe `Pass`               |
 |-------------------------------------------------------------|------------------------------------------------------------|
 | ![QUIC](docs/screenshots/01-browserleaks-quic.jpg)          | ![Twilio](docs/screenshots/04-twilio-webrtc.jpg)           |
 
@@ -217,7 +220,7 @@ around the engine.
 | Client Hints (Sec-CH-UA-* full stack with GREASE)             | ✅ full                       | ❌ partial / inconsistent     | ✅ full on Multilogin / AdsPower, ❌ Dolphin     |
 | Font enumeration pinned per profile                           | ✅ system-level               | ❌ JS-only, host fonts still leak via CSS / canvas font-render | ⚠️ partial          |
 | V8 / CDP side-channel hardening (preview-getters, inspector)  | ✅ closed                     | ❌ open — CDP automation detectable | ⚠️ partial                                |
-| TLS ClientHello fingerprint (JA4)                             | ✅ matches real Chrome 148    | ⚠️ static / drifts on uprev   | ✅ matches the forked Chrome version            |
+| TLS ClientHello fingerprint (JA4)                             | ✅ matches real Chrome 149    | ⚠️ static / drifts on uprev   | ✅ matches the forked Chrome version            |
 | QUIC / HTTP-3 over SOCKS5                                     | ✅ stable end-to-end via UDP relay | ⚠️ implemented but unstable — falls back to TCP / drops mid-session | ❌ disabled when proxy is set |
 | WebRTC over SOCKS5 (no real-IP leak via STUN)                 | ✅ proxy UDP relay or synth candidates | ⚠️ same UDP relay path, same instability | ⚠️ disable-only            |
 | Consistency of generated profiles                             | ✅ coherent device (GPU ↔ CPU ↔ RAM ↔ UA ↔ fonts) | ❌ frequent contradictions (Win UA + Mac GPU, mobile UA + desktop screen, etc.) | ⚠️ varies |
@@ -234,10 +237,9 @@ detector — generally don't bother to probe most of the surfaces below,
 so an anti-detect that fails any of them can still light up all green
 on those pages and feel like everything's fine.
 
-Real production anti-fraud stacks (the ones banks, marketplaces, ad
-networks, ticketing sites, online betting and dating platforms run)
-do check them, and the gap is exactly where accounts get flagged a
-few sessions in instead of immediately:
+Real production anti-fraud stacks do check them, and the gap is
+exactly where accounts get flagged a few sessions in instead of
+immediately:
 
 * `navigator.gpu.requestAdapter()` returns the **host** GPU on
   CloakBrowser, so a profile claiming an RTX 4060 on Windows leaks the
@@ -431,20 +433,23 @@ Minimal stdio registration:
 }
 ```
 
-### 4. Standalone SDKs (Python / Node)
+### 4. Standalone SDKs (Python / Node / Rust)
 
 Self-contained client libraries that **don't need the desktop app at
 all** — they download the same engine + fingerprint library on first
-use and launch profiles directly via subprocess, with [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright)
-(stealth Playwright) attached for control. Same pre-launch pipeline as
-the launcher: UDP probe → conditional QUIC, geo-resolve for auto
-fields, screen strategy, host-aware hardware randomisation.
+use and launch profiles directly via subprocess, with a browser-control
+client attached — [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright)
+(stealth Playwright) for Python/Node, [chromiumoxide](https://docs.rs/chromiumoxide)
+(CDP) for Rust. Same pre-launch pipeline as the launcher: UDP probe →
+conditional QUIC, geo-resolve for auto fields, screen strategy, host-aware
+hardware randomisation.
 
 Use the SDK when you want ShardX as a library inside a scraper / CI
 job / server-side worker without installing the GUI.
 
 * **Python** — [sdks/python/README.md](sdks/python/README.md) — `pip install shardx`
 * **Node** — [sdks/node/README.md](sdks/node/README.md) — `npm install @proxyshard/shardx`
+* **Rust** — [sdks/rust/README.md](sdks/rust/README.md) — `cargo add shardx`
 
 ---
 
@@ -455,7 +460,7 @@ The **launcher** (everything in this `rust/shardx-launcher/` directory
 License** — see [LICENSE](LICENSE). Use it, fork it, modify it, ship
 it, commercially or otherwise.
 
-The **browser engine** (the patched Chromium 148 binary that the
+The **browser engine** (the patched Chromium 149 binary that the
 launcher downloads from our CDN on first run) is distributed as a
 **closed-source binary**. Its source is not published in this
 repository or elsewhere, and the following are explicitly **not

@@ -152,7 +152,7 @@ export class ShardX {
 
 export { Runtime, defaultCacheDir, PUB_BASE, CHROMIUM_VERSION, hostSpec } from "./runtime.js";
 export type { ProgressCb, HostSpec, Archive } from "./runtime.js";
-export { Profile, FingerprintLibrary, userDataDir } from "./profile.js";
+export { Profile, FingerprintLibrary, userDataDir, applyEngineVersion } from "./profile.js";
 export { Browser, BrowserSession } from "./browser.js";
 export type { LaunchOptions, WebRtcMode, ScreenMode } from "./browser.js";
 export { parseProxy, probeUdp, proxyToArg } from "./proxy.js";

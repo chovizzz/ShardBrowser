@@ -1162,6 +1162,12 @@ pub fn run() {
                 }
             }
 
+            // Migrate already-created profiles' UA + client_hints to the
+            // current engine version (independent of the fingerprint seed).
+            tauri::async_runtime::spawn(async {
+                runtime::ensure_profiles_migrated().await;
+            });
+
             // Clean up temporary profiles from crashed runs.
             match profile::purge_temporary() {
                 Ok(n) if n > 0 => eprintln!("[launcher] purged {n} stale temporary profile(s)"),

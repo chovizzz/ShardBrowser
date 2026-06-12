@@ -9,9 +9,13 @@ use tauri::{Emitter, Window};
 use tokio::io::AsyncWriteExt;
 
 const PUB_BASE: &str = "https://pub-e57a7c60f6934eb09a6600bf2fc59cdc.r2.dev";
+/// Version manifest (GitHub raw) — one tiny GET yields every archive's current
+/// etag, so install/status checks never poll R2/S3 per-archive.
+const MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/ProxyShard/ShardBrowser/main/runtime.json";
 const LAUNCHER_RELEASE_REPO: &str = "ProxyShard/ShardBrowser";
 /// Chromium version baked into the current bundle (used for Mac Framework path).
-const CHROMIUM_VERSION: &str = "148.0.7778.216";
+const CHROMIUM_VERSION: &str = "149.0.7827.103";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ArchiveSpec {
@@ -101,6 +105,11 @@ struct Manifest {
     browser_etag: Option<String>,
     widevine_etag: Option<String>,
     fingerprints_etag: Option<String>,
+    /// Chromium version the *already-created* profiles were last migrated to.
+    /// Lets us bump saved profiles' UA + client_hints when the engine updates,
+    /// independent of the fingerprint-library seed.
+    #[serde(default)]
+    applied_chromium_version: Option<String>,
 }
 
 fn load_manifest() -> Manifest {
@@ -130,13 +139,140 @@ pub struct RuntimeStatus {
     pub fingerprints_installed: bool,
 }
 
-async fn head_etag(url: &str) -> Result<Option<String>> {
-    let resp = reqwest::Client::new().head(url).send().await?;
-    Ok(resp
-        .headers()
-        .get("etag")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim_matches('"').to_string()))
+#[derive(Default)]
+struct RemoteManifest {
+    archives: std::collections::HashMap<String, String>,
+    chromium_version: Option<String>,
+}
+
+/// Fetch the version manifest (GitHub raw) — one request yielding every
+/// archive's current etag + the chromium version, so install/status never poll
+/// R2/S3 per-archive. Empty/None when unreachable.
+async fn fetch_manifest() -> RemoteManifest {
+    async fn inner() -> Option<RemoteManifest> {
+        let resp = reqwest::Client::new().get(MANIFEST_URL).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let v: serde_json::Value = resp.json().await.ok()?;
+        let archives = v
+            .get("archives")
+            .and_then(|a| a.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let chromium_version = v
+            .get("chromium_version")
+            .and_then(|s| s.as_str())
+            .map(String::from);
+        Some(RemoteManifest {
+            archives,
+            chromium_version,
+        })
+    }
+    inner().await.unwrap_or_default()
+}
+
+/// Migrate every `*.json` in `dir` to a new engine version: bump
+/// `navigator.user_agent` (Chrome/<major>.0.0.0) and the chrome-version fields
+/// in `client_hints` (brand_version / brand_full_version / chrome_build /
+/// chrome_patch). Leaves platform_version, architecture, grease, webgl, etc.
+/// intact. Returns the number of files actually changed.
+fn migrate_dir_to(dir: &Path, chromium_version: &str) -> Result<usize> {
+    let parts: Vec<&str> = chromium_version.split('.').collect();
+    if parts.len() != 4 {
+        return Ok(0);
+    }
+    let major = parts[0];
+    let build: i64 = parts[2].parse().unwrap_or(0);
+    let patch: i64 = parts[3].parse().unwrap_or(0);
+
+    let mut n = 0usize;
+    for ent in fs::read_dir(dir)?.flatten() {
+        let p = ent.path();
+        if p.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&p) else { continue };
+        let Ok(mut cfg) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+        let mut changed = false;
+
+        // navigator.user_agent: replace the Chrome/<ver> token with major.0.0.0.
+        if let Some(ua) = cfg
+            .pointer("/navigator/user_agent")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+        {
+            if let Some(idx) = ua.find("Chrome/") {
+                let rest = &ua[idx + 7..];
+                let end = rest.find(' ').unwrap_or(rest.len());
+                let new_ua = format!("{}Chrome/{}.0.0.0{}", &ua[..idx], major, &rest[end..]);
+                if new_ua != ua {
+                    if let Some(slot) = cfg.pointer_mut("/navigator/user_agent") {
+                        *slot = serde_json::Value::String(new_ua);
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        if let Some(ch) = cfg.get_mut("client_hints").and_then(|v| v.as_object_mut()) {
+            for (k, want) in [
+                ("brand_version", serde_json::json!(major)),
+                ("brand_full_version", serde_json::json!(chromium_version)),
+                ("chrome_build", serde_json::json!(build)),
+                ("chrome_patch", serde_json::json!(patch)),
+            ] {
+                if ch.get(k) != Some(&want) {
+                    ch.insert(k.to_string(), want);
+                    changed = true;
+                }
+            }
+        }
+
+        if changed {
+            fs::write(&p, serde_json::to_string_pretty(&cfg)?)?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// Migrate both the saved profiles AND the fingerprint library (bundled +
+/// user-added) to `chromium_version`. Bundled templates are already at the new
+/// version after the seed; user-added fingerprints get their UA + client_hints
+/// bumped here (their custom fields are preserved).
+fn migrate_all_to(chromium_version: &str) -> usize {
+    let mut n = 0;
+    if let Ok(d) = crate::store::profiles_dir() {
+        n += migrate_dir_to(&d, chromium_version).unwrap_or(0);
+    }
+    if let Ok(d) = crate::store::fingerprints_dir() {
+        n += migrate_dir_to(&d, chromium_version).unwrap_or(0);
+    }
+    n
+}
+
+/// Startup hook: migrate saved profiles + the fingerprint library to the
+/// manifest's chromium version when not already done. One GitHub-manifest GET
+/// (never S3); the migration itself runs once per version change, guarded by
+/// the stored `applied_chromium_version`. Also covers users whose engine
+/// auto-updated via the etag path without an explicit `runtime_install`.
+pub async fn ensure_profiles_migrated() {
+    let Some(target) = fetch_manifest().await.chromium_version else { return };
+    let mut local = load_manifest();
+    if local.applied_chromium_version.as_deref() == Some(target.as_str()) {
+        return;
+    }
+    let n = migrate_all_to(&target);
+    if n > 0 {
+        eprintln!("[runtime] migrated {n} profile/fingerprint file(s) to {target}");
+    }
+    local.applied_chromium_version = Some(target);
+    let _ = save_manifest(&local);
 }
 
 #[tauri::command]
@@ -144,13 +280,10 @@ pub async fn runtime_status() -> Result<RuntimeStatus, String> {
     let spec = host_spec();
     let installed = binary_path().map(|p| p.exists()).unwrap_or(false);
     let m = load_manifest();
-    let remote = if let Some(s) = &spec {
-        head_etag(&format!("{PUB_BASE}/{}", s.browser.key))
-            .await
-            .unwrap_or(None)
-    } else {
-        None
-    };
+    let manifest = fetch_manifest().await;
+    let remote = spec
+        .as_ref()
+        .and_then(|s| manifest.archives.get(&s.browser.key).cloned());
     let update_available = match (&m.browser_etag, &remote) {
         (Some(a), Some(b)) => a != b,
         // Don't flag update when R2 unreachable but binary exists.
@@ -190,15 +323,17 @@ pub async fn runtime_install(window: Window, force: bool) -> Result<RuntimeStatu
 
     let installed_now = binary_path().map(|p| p.exists()).unwrap_or(false);
     let local = load_manifest();
+    let manifest = fetch_manifest().await;
 
-    // Skip browser when binary on disk and etag matches remote (unless forced).
+    // Skip browser when binary on disk and etag matches the manifest (unless
+    // forced). Manifest unreachable → don't force a re-download.
     let need_browser = if force || !installed_now {
         true
     } else {
-        let remote = head_etag(&format!("{PUB_BASE}/{}", spec.browser.key))
-            .await
-            .map_err(|e| e.to_string())?;
-        local.browser_etag.as_ref() != remote.as_ref()
+        match manifest.archives.get(&spec.browser.key) {
+            Some(rb) => local.browser_etag.as_deref() != Some(rb.as_str()),
+            None => false,
+        }
     };
     let browser_etag = if need_browser {
         download_and_extract(&window, &spec.browser, &base)
@@ -223,16 +358,33 @@ pub async fn runtime_install(window: Window, force: bool) -> Result<RuntimeStatu
         None
     };
 
-    // Additive fingerprint seed (preserves user edits); skipped when etag matches.
-    let fp_etag = install_fingerprints(&window, force, local.fingerprints_etag.as_deref())
+    // Fingerprint seed: overwrites bundled templates, leaves user-added files;
+    // skipped when the etag matches. User-added FP get version-migrated below.
+    let fp_remote = manifest.archives.get(FINGERPRINTS_ARCHIVE_KEY).map(|s| s.as_str());
+    let fp_etag = install_fingerprints(&window, force, local.fingerprints_etag.as_deref(), fp_remote)
         .await
         .map_err(|e| e.to_string())?
         .or(local.fingerprints_etag);
+
+    // Migrate already-created profiles AND the fingerprint library (incl.
+    // user-added) to the new engine version (UA + client_hints). Runs only when
+    // the target version changed since the last migration.
+    let target_ver = manifest
+        .chromium_version
+        .clone()
+        .unwrap_or_else(|| CHROMIUM_VERSION.to_string());
+    if local.applied_chromium_version.as_deref() != Some(target_ver.as_str()) {
+        let n = migrate_all_to(&target_ver);
+        if n > 0 {
+            eprintln!("[runtime] migrated {n} profile/fingerprint file(s) to {target_ver}");
+        }
+    }
 
     save_manifest(&Manifest {
         browser_etag: Some(browser_etag),
         widevine_etag,
         fingerprints_etag: fp_etag,
+        applied_chromium_version: Some(target_ver),
     })
     .map_err(|e| e.to_string())?;
 
@@ -240,16 +392,16 @@ pub async fn runtime_install(window: Window, force: bool) -> Result<RuntimeStatu
     runtime_status().await
 }
 
-/// Download + seed fingerprint library; `force=true` overwrites, `false` is additive.
+/// Download + seed fingerprint library. Bundled templates are always
+/// overwritten (so version bumps propagate); user-added files are left in place.
 async fn install_fingerprints(
     window: &Window,
     force: bool,
     local_etag: Option<&str>,
+    remote_etag: Option<&str>,
 ) -> Result<Option<String>> {
-    let url = format!("{PUB_BASE}/{FINGERPRINTS_ARCHIVE_KEY}");
-
     if !force {
-        if let (Some(local), Some(remote)) = (local_etag, head_etag(&url).await.ok().flatten().as_deref()) {
+        if let (Some(local), Some(remote)) = (local_etag, remote_etag) {
             if local == remote {
                 return Ok(None);
             }
@@ -271,24 +423,22 @@ async fn install_fingerprints(
     let walk = if src.exists() { src } else { staging.clone() };
     let mut added = 0;
     let mut overwritten = 0;
-    let mut skipped_existing = 0;
     for ent in fs::read_dir(&walk)? {
         let ent = ent?;
         let p = ent.path();
         if p.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
+        // Always overwrite bundled templates so engine-version bumps reach
+        // existing libraries. User-added fingerprints (names not in the bundle)
+        // are never iterated here, so they stay untouched.
         let dst = dir.join(p.file_name().unwrap());
-        match (dst.exists(), force) {
-            (true, false)  => { skipped_existing += 1; }
-            (true, true)   => { fs::copy(&p, &dst)?; overwritten += 1; }
-            (false, _)     => { fs::copy(&p, &dst)?; added += 1; }
-        }
+        let existed = dst.exists();
+        fs::copy(&p, &dst)?;
+        if existed { overwritten += 1; } else { added += 1; }
     }
     let _ = fs::remove_dir_all(&staging);
-    eprintln!(
-        "[runtime] fingerprints sync: added={added} overwritten={overwritten} kept-existing={skipped_existing}"
-    );
+    eprintln!("[runtime] fingerprints sync: added={added} overwritten={overwritten}");
     Ok(Some(etag))
 }
 
