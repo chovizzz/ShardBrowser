@@ -8,6 +8,7 @@ mod mcp_setup;
 mod process;
 mod profile;
 mod proxy;
+mod proxy_auth;
 mod psapi;
 mod runtime;
 mod settings;

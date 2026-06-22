@@ -215,6 +215,22 @@ pub async fn launch_profile(
             Some(c) => {
                 eprintln!("[launcher] CDP ready for {profile_id}: {}", c.web_socket_debugger_url);
                 Tracker::shared().set_cdp(profile_id, c.clone());
+                // Chromium ignores credentials in --proxy-server, so for an
+                // authenticated HTTP/HTTPS proxy we supply them over CDP
+                // (answering Fetch.authRequired) instead of letting Chrome pop
+                // a Basic-auth dialog. SOCKS5 auth is handled at the SOCKS layer.
+                if let Some(p) = bound_proxy.as_ref() {
+                    if matches!(p.kind, proxy::ProxyKind::Http | proxy::ProxyKind::Https)
+                        && !p.username.is_empty()
+                    {
+                        crate::proxy_auth::spawn(
+                            c.web_socket_debugger_url.clone(),
+                            p.username.clone(),
+                            p.password.clone(),
+                        );
+                        eprintln!("[launcher] proxy-auth handler attached for {}", p.host);
+                    }
+                }
                 Some(c)
             }
             None => {
