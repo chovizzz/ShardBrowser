@@ -635,6 +635,24 @@ function TeamView() {
   const [opening, setOpening] = useState<string | null>(null);
   const [role, setRole] = useState<string>("");
   const [locks, setLocks] = useState<Record<string, LockStatus | null>>({});
+  const [pending, setPending] = useState<Record<string, boolean>>({});
+  const [retrying, setRetrying] = useState<string | null>(null);
+  const [insecure, setInsecure] = useState<string | null>(null);
+
+  // Flag cleartext http:// to a non-loopback host as the user types the URL.
+  useEffect(() => {
+    let live = true;
+    if (!server.trim()) {
+      setInsecure(null);
+      return;
+    }
+    invoke<string | null>("remote_transport_warning", { server })
+      .then((w) => live && setInsecure(w))
+      .catch(() => live && setInsecure(null));
+    return () => {
+      live = false;
+    };
+  }, [server]);
 
   const refreshCfg = () =>
     invoke<RemoteConfig>("remote_get_config")
@@ -659,6 +677,45 @@ function TeamView() {
       }),
     );
     setLocks(Object.fromEntries(entries));
+    // A profile carries un-pushed changes when a checkin failed on last close.
+    // remote_open makes the local profile id equal the env id.
+    const pend = await Promise.all(
+      list.map(async (e) => {
+        try {
+          return [e.id, await invoke<boolean>("remote_has_pending", { profileId: e.id })] as const;
+        } catch {
+          return [e.id, false] as const;
+        }
+      }),
+    );
+    setPending(Object.fromEntries(pend));
+  };
+
+  const retryPush = async (env: RemoteEnv) => {
+    setRetrying(env.id);
+    try {
+      await invoke("remote_retry_push", { profileId: env.id, envId: env.id });
+      toast.ok(`Pushed pending changes for “${env.name}”`);
+      loadLocks(envs);
+    } catch (e) {
+      toast.err("Retry push failed: " + String(e));
+    } finally {
+      setRetrying(null);
+    }
+  };
+
+  const discardPending = async (env: RemoteEnv) => {
+    setRetrying(env.id);
+    try {
+      await invoke("remote_discard_pending", { profileId: env.id, envId: env.id });
+      toast.ok(`Discarded local changes for “${env.name}”`);
+      setPending((p) => ({ ...p, [env.id]: false }));
+      loadLocks(envs);
+    } catch (e) {
+      toast.err("Discard failed: " + String(e));
+    } finally {
+      setRetrying(null);
+    }
   };
 
   const loadEnvs = async () => {
@@ -686,8 +743,13 @@ function TeamView() {
   const login = async () => {
     setBusy(true);
     try {
-      await invoke("remote_login", { server, username, password });
+      const res = await invoke<{ insecure_transport?: string | null }>("remote_login", {
+        server,
+        username,
+        password,
+      });
       toast.ok("Connected to team server");
+      if (res?.insecure_transport) toast.err(res.insecure_transport);
       setPassword("");
       await refreshCfg();
     } catch (e) {
@@ -743,6 +805,11 @@ function TeamView() {
         </p>
         <div style={{ display: "grid", gap: 8, maxWidth: 360, marginTop: 16 }}>
           <input placeholder="https://host:8080" value={server} onChange={(e) => setServer(e.target.value)} />
+          {insecure && (
+            <div style={{ color: "var(--warn, #e0a030)", fontSize: 12, lineHeight: 1.4 }}>
+              ⚠ {insecure}
+            </div>
+          )}
           <input placeholder="username" value={username} onChange={(e) => setUsername(e.target.value)} />
           <input
             placeholder="password"
@@ -805,16 +872,49 @@ function TeamView() {
                   <td style={{ padding: "8px" }}>{e.name}</td>
                   <td style={{ padding: "8px", opacity: 0.8 }}>{e.host_os ?? "—"}</td>
                   <td style={{ padding: "8px", opacity: 0.8 }}>{e.current_version > 0 ? `v${e.current_version}` : "—"}</td>
-                  <td style={{ padding: "8px", opacity: 0.8, color: lockedByOther ? "var(--warn, #e0a030)" : undefined }}>{status}</td>
+                  <td style={{ padding: "8px", opacity: 0.8, color: lockedByOther ? "var(--warn, #e0a030)" : undefined }}>
+                    {status}
+                    {pending[e.id] && (
+                      <span style={{ color: "var(--warn, #e0a030)", marginLeft: 8 }} title="The browser closed but the last check-in failed. Retry to push your changes.">
+                        · unsynced changes
+                      </span>
+                    )}
+                  </td>
                   <td style={{ padding: "8px", textAlign: "right", whiteSpace: "nowrap" }}>
+                    {pending[e.id] && (
+                      <>
+                        <button
+                          disabled={retrying !== null || lockedByOther}
+                          onClick={() => retryPush(e)}
+                          style={{ marginRight: 8 }}
+                          title={lockedByOther ? `In use by ${lk?.owner_username ?? "another user"}` : "Push the changes from your last session"}
+                        >
+                          {retrying === e.id ? "Pushing…" : "Retry push"}
+                        </button>
+                        <button
+                          disabled={retrying !== null}
+                          onClick={() => discardPending(e)}
+                          style={{ marginRight: 8 }}
+                          title="Discard the un-pushed local changes (cannot be undone)"
+                        >
+                          Discard
+                        </button>
+                      </>
+                    )}
                     {role === "admin" && lk?.locked && !lk?.held_by_me && (
                       <button onClick={() => forceUnlock(e)} style={{ marginRight: 8 }}>
                         Force unlock
                       </button>
                     )}
                     <button
-                      disabled={opening !== null || lockedByOther}
-                      title={lockedByOther ? `In use by ${lk?.owner_username ?? "another user"}` : undefined}
+                      disabled={opening !== null || lockedByOther || pending[e.id]}
+                      title={
+                        pending[e.id]
+                          ? "Retry or discard the pending check-in before launching"
+                          : lockedByOther
+                            ? `In use by ${lk?.owner_username ?? "another user"}`
+                            : undefined
+                      }
                       onClick={() => openEnv(e)}
                     >
                       {opening === e.id ? "Opening…" : "Open & Launch"}

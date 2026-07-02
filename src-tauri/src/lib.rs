@@ -1140,6 +1140,13 @@ fn remote_set_config(server: Option<String>, token: Option<String>) -> Result<()
     settings::save(&s).map_err(|e| e.to_string())
 }
 
+/// Non-fatal cleartext-transport warning for a server URL, or null if it's
+/// secure (https / loopback). Lets the UI flag `http://` before connecting.
+#[tauri::command]
+fn remote_transport_warning(server: String) -> Option<String> {
+    sync::insecure_transport_warning(&server)
+}
+
 #[tauri::command]
 async fn remote_login(server: String, username: String, password: String) -> Result<Value, String> {
     let token = sync::login(&server, &username, &password)
@@ -1150,7 +1157,10 @@ async fn remote_login(server: String, username: String, password: String) -> Res
     s.remote_token = Some(token);
     ensure_client_id(&mut s);
     settings::save(&s).map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "ok": true }))
+    Ok(serde_json::json!({
+        "ok": true,
+        "insecure_transport": sync::insecure_transport_warning(&server),
+    }))
 }
 
 #[tauri::command]
@@ -1189,15 +1199,50 @@ async fn remote_open(env_id: String) -> Result<String, String> {
     if let Some(name) = detail.get("name").and_then(|n| n.as_str()) {
         config.insert("name".into(), Value::String(name.to_string()));
     }
+    // The env may bind a server-side proxy; `GET /envs/{id}` inlines its full
+    // credentials (ACL-gated). Carry it as an inline proxy so the normal launch
+    // path uses it without needing a matching local proxy-store entry. Built by
+    // hand because the server sends username/password as JSON null when unset,
+    // which won't deserialize into ProxyEntry's plain String fields.
+    let inline_proxy = detail.get("proxy").filter(|p| p.is_object()).and_then(|p| {
+        let kind = match p.get("kind").and_then(|k| k.as_str()) {
+            Some("http") => proxy::ProxyKind::Http,
+            Some("https") => proxy::ProxyKind::Https,
+            Some("socks5") => proxy::ProxyKind::Socks5,
+            _ => return None,
+        };
+        let host = p.get("host").and_then(|h| h.as_str())?.to_string();
+        let port = p.get("port").and_then(|v| v.as_u64()).and_then(|n| u16::try_from(n).ok())?;
+        let s = |k: &str| p.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        Some(proxy::ProxyEntry {
+            id: s("id"),
+            name: s("name"),
+            kind,
+            host,
+            port,
+            username: s("username"),
+            password: s("password"),
+            country: String::new(),
+            notes: String::new(),
+        })
+    });
     let mut stored = profile::StoredProfile {
         meta: profile::StoredMeta {
             id: env_id.clone(),
             remote_env_id: Some(env_id.clone()),
             folder: "Remote".into(),
+            inline_proxy,
             ..Default::default()
         },
         config,
     };
+    // Preserve local pending-push state across re-opens (don't clobber a
+    // profile that still owes the server a checkin).
+    if let Ok(existing) = profile::load_raw(&env_id) {
+        stored.meta.remote_pending_push = existing.meta.remote_pending_push;
+        stored.meta.remote_lock_token = existing.meta.remote_lock_token;
+        stored.meta.remote_base_version = existing.meta.remote_base_version;
+    }
     profile::save_raw(&mut stored).map_err(|e| e.to_string())?;
     Ok(env_id)
 }
@@ -1217,14 +1262,33 @@ async fn remote_push(profile_id: String, env_id: String) -> Result<Value, String
     sync::push(&profile_id, &env_id).await.map_err(|e| e.to_string())
 }
 
+/// Retry a checkin that failed when the browser last closed. Refuses to
+/// overwrite if the environment moved on the server since checkout.
 #[tauri::command]
-async fn remote_lease(env_id: String) -> Result<Value, String> {
-    sync::lease(&env_id).await.map_err(|e| e.to_string())
+async fn remote_retry_push(profile_id: String, env_id: String) -> Result<Value, String> {
+    sync::retry_push(&profile_id, &env_id).await.map_err(|e| e.to_string())
+}
+
+/// True if a profile has un-pushed local changes from a failed checkin.
+#[tauri::command]
+fn remote_has_pending(profile_id: String) -> bool {
+    sync::has_pending_push(&profile_id)
+}
+
+/// Discard un-pushed local changes (accept the loss); next launch pulls fresh.
+#[tauri::command]
+async fn remote_discard_pending(profile_id: String, env_id: String) -> Result<(), String> {
+    sync::discard_pending(&profile_id, &env_id).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn remote_release(env_id: String) -> Result<Value, String> {
-    sync::release(&env_id).await.map_err(|e| e.to_string())
+async fn remote_lease(profile_id: String, env_id: String) -> Result<Value, String> {
+    sync::lease(&profile_id, &env_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn remote_release(profile_id: String, env_id: String) -> Result<Value, String> {
+    sync::release(&profile_id, &env_id).await.map_err(|e| e.to_string())
 }
 
 pub fn run() {
@@ -1315,6 +1379,7 @@ pub fn run() {
             runtime::launcher_update_check,
             remote_get_config,
             remote_set_config,
+            remote_transport_warning,
             remote_login,
             remote_logout,
             remote_me,
@@ -1324,6 +1389,9 @@ pub fn run() {
             remote_lock_status,
             remote_pull,
             remote_push,
+            remote_retry_push,
+            remote_has_pending,
+            remote_discard_pending,
             remote_lease,
             remote_release,
         ])

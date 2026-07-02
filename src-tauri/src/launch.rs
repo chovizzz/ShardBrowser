@@ -47,6 +47,18 @@ pub async fn launch_profile(
     let stored = profile::load_raw(profile_id)?;
     let udd = profile::user_data_dir(profile_id)?;
 
+    // Refuse a second launch of the same profile. The Tracker is keyed by
+    // profile_id, so a re-launch would orphan the first child's exit handler
+    // (leaking its checkin/runtime accounting) and, for shared environments,
+    // let two engines write the same user-data-dir under one lock.
+    if crate::process::Tracker::shared()
+        .running()
+        .iter()
+        .any(|r| r.profile_id == profile_id)
+    {
+        anyhow::bail!("profile is already running");
+    }
+
     // Team Server: if this profile mirrors a shared environment, check it out
     // (acquire the lock + pull the latest snapshot into `udd`, re-encrypting
     // cookies for this machine) before launching. A 409 here means someone else
@@ -54,6 +66,15 @@ pub async fn launch_profile(
     let remote_env_id = stored.meta.remote_env_id.clone();
     if let Some(env_id) = remote_env_id.as_deref() {
         if crate::sync::is_configured() {
+            // A failed checkin left un-pushed changes in this udd. Pulling now
+            // would overwrite them with the server's copy — refuse until the
+            // user retries or discards the pending push.
+            if stored.meta.remote_pending_push {
+                anyhow::bail!(
+                    "this shared environment has un-pushed local changes from the last \
+                     session — retry or discard the pending check-in before launching"
+                );
+            }
             crate::sync::pull(profile_id, env_id)
                 .await
                 .with_context(|| format!("check out shared environment {env_id}"))?;
