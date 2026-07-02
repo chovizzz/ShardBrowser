@@ -287,7 +287,7 @@ type ApiInfo = {
   base_url: string;
   token: string;
 };
-type Section = "browsers" | "proxies" | "proxyshard" | "fingerprints" | "settings";
+type Section = "browsers" | "team" | "proxies" | "proxyshard" | "fingerprints" | "settings";
 
 /// Library fingerprint backing the editor GPU select; payload supplies the coherent base.
 type FingerprintEntry = {
@@ -593,6 +593,243 @@ function toStored(f: ProfileForm, lib: FingerprintEntry | null): any {
   return base;
 }
 
+// ---- Team Server (shared environments) ----
+
+function IconTeam() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <circle cx="8" cy="9" r="3" stroke="currentColor" strokeWidth="1.6" />
+      <circle cx="16.5" cy="10" r="2.3" stroke="currentColor" strokeWidth="1.6" />
+      <path d="M3 19c0-2.8 2.2-5 5-5s5 2.2 5 5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+      <path d="M14 19c0-2 1-3.6 3-4.2" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+type RemoteEnv = {
+  id: string;
+  name: string;
+  host_os: string | null;
+  current_version: number;
+  notes?: string;
+};
+
+type RemoteConfig = { server: string | null; has_token: boolean; client_id: string | null };
+
+type LockStatus = {
+  locked: boolean;
+  owner_username?: string | null;
+  held_by_me?: boolean;
+  expired?: boolean;
+  lease_expires_at?: string;
+};
+
+function TeamView() {
+  const [cfg, setCfg] = useState<RemoteConfig | null>(null);
+  const [server, setServer] = useState("");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [envs, setEnvs] = useState<RemoteEnv[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [opening, setOpening] = useState<string | null>(null);
+  const [role, setRole] = useState<string>("");
+  const [locks, setLocks] = useState<Record<string, LockStatus | null>>({});
+
+  const refreshCfg = () =>
+    invoke<RemoteConfig>("remote_get_config")
+      .then((c) => {
+        setCfg(c);
+        if (c.server) setServer(c.server);
+      })
+      .catch(() => {});
+
+  useEffect(() => {
+    refreshCfg();
+  }, []);
+
+  const loadLocks = async (list: RemoteEnv[]) => {
+    const entries = await Promise.all(
+      list.map(async (e) => {
+        try {
+          return [e.id, await invoke<LockStatus>("remote_lock_status", { envId: e.id })] as const;
+        } catch {
+          return [e.id, null] as const;
+        }
+      }),
+    );
+    setLocks(Object.fromEntries(entries));
+  };
+
+  const loadEnvs = async () => {
+    setLoading(true);
+    try {
+      const list = await invoke<RemoteEnv[]>("remote_list_envs");
+      setEnvs(list);
+      loadLocks(list);
+    } catch (e) {
+      toast.err("Failed to load environments: " + String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (cfg?.has_token) {
+      loadEnvs();
+      invoke<{ role?: string }>("remote_me")
+        .then((m) => setRole(m.role ?? ""))
+        .catch(() => {});
+    }
+  }, [cfg?.has_token]);
+
+  const login = async () => {
+    setBusy(true);
+    try {
+      await invoke("remote_login", { server, username, password });
+      toast.ok("Connected to team server");
+      setPassword("");
+      await refreshCfg();
+    } catch (e) {
+      toast.err("Login failed: " + String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const logout = async () => {
+    await invoke("remote_logout").catch(() => {});
+    setEnvs([]);
+    setLocks({});
+    setRole("");
+    await refreshCfg();
+  };
+
+  const forceUnlock = async (env: RemoteEnv) => {
+    try {
+      await invoke("remote_force_unlock", { envId: env.id });
+      toast.ok(`Unlocked “${env.name}”`);
+      loadLocks(envs);
+    } catch (e) {
+      toast.err("Force-unlock failed: " + String(e));
+    }
+  };
+
+  const openEnv = async (env: RemoteEnv) => {
+    setOpening(env.id);
+    try {
+      const pid = await invoke<string>("remote_open", { envId: env.id });
+      toast.ok(`Checking out “${env.name}”…`);
+      await invoke<number>("launch", { profileId: pid });
+      toast.ok(`Launched “${env.name}”`);
+    } catch (e) {
+      toast.err("Open failed: " + String(e));
+    } finally {
+      setOpening(null);
+      loadLocks(envs);
+    }
+  };
+
+  if (!cfg) return <div style={{ padding: 24 }}>Loading…</div>;
+
+  if (!cfg.has_token) {
+    return (
+      <div style={{ padding: 24, overflow: "auto" }}>
+        <h1>Team Server</h1>
+        <p style={{ opacity: 0.75, maxWidth: 520 }}>
+          Connect to your self-hosted ShardX Team Server to use shared environments.
+          Opening one checks it out (locking it for you) and pulls the latest data;
+          closing the browser checks it back in.
+        </p>
+        <div style={{ display: "grid", gap: 8, maxWidth: 360, marginTop: 16 }}>
+          <input placeholder="https://host:8080" value={server} onChange={(e) => setServer(e.target.value)} />
+          <input placeholder="username" value={username} onChange={(e) => setUsername(e.target.value)} />
+          <input
+            placeholder="password"
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && server && username && login()}
+          />
+          <button disabled={busy || !server || !username} onClick={login}>
+            {busy ? "Connecting…" : "Connect"}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ padding: 24, overflow: "auto" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+        <h1 style={{ margin: 0 }}>Team Server</h1>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ opacity: 0.6, fontSize: 13 }}>{cfg.server}</span>
+          <button disabled={loading} onClick={loadEnvs}>
+            {loading ? "…" : "Refresh"}
+          </button>
+          <button onClick={logout}>Disconnect</button>
+        </div>
+      </div>
+
+      {loading ? (
+        <p>Loading environments…</p>
+      ) : envs.length === 0 ? (
+        <p style={{ opacity: 0.7 }}>No environments are shared with you yet.</p>
+      ) : (
+        <table style={{ width: "100%", borderCollapse: "collapse", marginTop: 16 }}>
+          <thead>
+            <tr style={{ textAlign: "left", opacity: 0.6, fontSize: 13 }}>
+              <th style={{ padding: "6px 8px" }}>Name</th>
+              <th style={{ padding: "6px 8px" }}>OS</th>
+              <th style={{ padding: "6px 8px" }}>Version</th>
+              <th style={{ padding: "6px 8px" }}>Status</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {envs.map((e) => {
+              const lk = locks[e.id];
+              const lockedByOther = !!lk?.locked && !lk?.held_by_me && !lk?.expired;
+              const status = !lk
+                ? "—"
+                : !lk.locked
+                  ? "Available"
+                  : lk.held_by_me
+                    ? "In use by you"
+                    : lk.expired
+                      ? `Stale lock (${lk.owner_username ?? "?"})`
+                      : `In use by ${lk.owner_username ?? "another user"}`;
+              return (
+                <tr key={e.id} style={{ borderTop: "1px solid var(--border, #ffffff14)" }}>
+                  <td style={{ padding: "8px" }}>{e.name}</td>
+                  <td style={{ padding: "8px", opacity: 0.8 }}>{e.host_os ?? "—"}</td>
+                  <td style={{ padding: "8px", opacity: 0.8 }}>{e.current_version > 0 ? `v${e.current_version}` : "—"}</td>
+                  <td style={{ padding: "8px", opacity: 0.8, color: lockedByOther ? "var(--warn, #e0a030)" : undefined }}>{status}</td>
+                  <td style={{ padding: "8px", textAlign: "right", whiteSpace: "nowrap" }}>
+                    {role === "admin" && lk?.locked && !lk?.held_by_me && (
+                      <button onClick={() => forceUnlock(e)} style={{ marginRight: 8 }}>
+                        Force unlock
+                      </button>
+                    )}
+                    <button
+                      disabled={opening !== null || lockedByOther}
+                      title={lockedByOther ? `In use by ${lk?.owner_username ?? "another user"}` : undefined}
+                      onClick={() => openEnv(e)}
+                    >
+                      {opening === e.id ? "Opening…" : "Open & Launch"}
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
 // ---- app shell ----
 
 type Theme = "dark" | "light";
@@ -658,6 +895,7 @@ export default function App() {
           />
           <main className="main">
             {section === "browsers" && <BrowsersView />}
+            {section === "team" && <TeamView />}
             {section === "proxies" && <ProxiesView />}
             {section === "proxyshard" && <ProxyShardView />}
             {section === "fingerprints" && <FingerprintsView />}
@@ -685,6 +923,7 @@ function Sidebar({
       label: "Workspace",
       items: [
         { id: "browsers", label: "Browsers", svg: <IconShard /> },
+        { id: "team", label: "Team", svg: <IconTeam /> },
         { id: "proxies", label: "Proxies", svg: <IconWire /> },
         { id: "proxyshard", label: "ProxyShard", svg: <IconCart /> },
       ],

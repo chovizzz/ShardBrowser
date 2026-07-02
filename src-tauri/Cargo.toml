@@ -1,6 +1,6 @@
 [package]
 name = "shardx-launcher"
-version = "0.1.9"
+version = "0.1.10"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -34,7 +34,9 @@ anyhow = "1"
 dirs = "5"
 uuid = { version = "1", features = ["v4", "serde"] }
 url = "2"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks", "json", "multipart"] }
+# Shared cross-machine cookie encryption + portable user-data-dir snapshots (team sync).
+shardx-core = { path = "../shared" }
 base64 = "0.22"
 # Local automation HTTP API (axum) + JWT bearer auth.
 axum = "0.7"

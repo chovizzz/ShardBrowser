@@ -89,6 +89,20 @@ impl Tracker {
             if let Ok(mut g) = Self::shared().inner.lock() {
                 g.remove(&profile_id);
             }
+            // Team Server: the engine has fully exited (cookies DB flushed), so
+            // pack the user-data-dir, push it as a new snapshot, and release the
+            // lock. Best-effort — a failure here must not block local cleanup.
+            if let Some(env_id) = crate::profile::load_raw(&profile_id)
+                .ok()
+                .and_then(|p| p.meta.remote_env_id)
+            {
+                if crate::sync::is_configured() {
+                    match crate::sync::push(&profile_id, &env_id).await {
+                        Ok(_) => eprintln!("[launcher] checked in shared environment {env_id}"),
+                        Err(e) => eprintln!("[launcher] checkin failed for env {env_id}: {e}"),
+                    }
+                }
+            }
             // Bump the persisted total runtime; non-temporary only (temp
             // profiles get deleted next line so their counter is moot).
             if !temporary {

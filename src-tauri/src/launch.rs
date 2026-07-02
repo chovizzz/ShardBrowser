@@ -47,6 +47,19 @@ pub async fn launch_profile(
     let stored = profile::load_raw(profile_id)?;
     let udd = profile::user_data_dir(profile_id)?;
 
+    // Team Server: if this profile mirrors a shared environment, check it out
+    // (acquire the lock + pull the latest snapshot into `udd`, re-encrypting
+    // cookies for this machine) before launching. A 409 here means someone else
+    // holds it — abort the launch and surface that to the caller.
+    let remote_env_id = stored.meta.remote_env_id.clone();
+    if let Some(env_id) = remote_env_id.as_deref() {
+        if crate::sync::is_configured() {
+            crate::sync::pull(profile_id, env_id)
+                .await
+                .with_context(|| format!("check out shared environment {env_id}"))?;
+        }
+    }
+
     // Stored proxy by id, else ephemeral inline (quick profiles, not in store).
     let bound_proxy: Option<proxy::ProxyEntry> = stored
         .meta
@@ -207,6 +220,14 @@ pub async fn launch_profile(
     }
     let child = cmd.spawn().context("spawn ShardX")?;
     let pid = Tracker::shared().track(profile_id.to_string(), child, stored.meta.temporary);
+
+    // Keep the checkout lease alive while the engine runs; the Tracker's exit
+    // hook checks the environment back in (push + release) on close.
+    if let Some(env_id) = remote_env_id {
+        if crate::sync::is_configured() {
+            crate::sync::spawn_lease_renewer(profile_id.to_string(), env_id);
+        }
+    }
 
     profile::touch_launched(profile_id, None)?;
 

@@ -60,6 +60,11 @@ pub struct StoredMeta {
     /// Hidden from listings; auto-deleted on close.
     #[serde(default, skip_serializing_if = "is_false")]
     pub temporary: bool,
+    /// Team Server shared-environment id this profile mirrors. When set, the
+    /// launcher checks the environment out (lock + pull) before launch and
+    /// checks it back in (push + release) on close.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_env_id: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {

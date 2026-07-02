@@ -27,6 +27,8 @@ sdks/python/build/
 
 # ===== Rust / Tauri build artifacts =====
 src-tauri/target/
+server/target/
+shared/target/
 src-tauri/Cargo.lock.bak
 src-tauri/.cargo-lock
 src-tauri/gen/

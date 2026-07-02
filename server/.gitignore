@@ -1,0 +1,6 @@
+# Rust build output
+/target
+
+# Runtime data (SQLite DB + snapshot blobs) and local env
+/data
+.env

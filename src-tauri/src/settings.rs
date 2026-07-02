@@ -33,6 +33,17 @@ pub struct Settings {
     /// (see `ensure_secret`); rotating it invalidates issued tokens.
     #[serde(default)]
     pub api_secret: String,
+
+    // ---- Team Server (shared environments, Phase 4) ----
+    /// Base URL of the self-hosted ShardX Team Server (e.g. https://host:8080).
+    #[serde(default)]
+    pub remote_server: Option<String>,
+    /// Bearer token from the team server login.
+    #[serde(default)]
+    pub remote_token: Option<String>,
+    /// Stable per-install id distinguishing this client's checkout lease.
+    #[serde(default)]
+    pub remote_client_id: Option<String>,
 }
 
 fn default_theme() -> String {
@@ -63,6 +74,9 @@ pub fn load() -> Result<Settings> {
             api_enabled: default_api_enabled(),
             api_port: default_api_port(),
             api_secret: String::new(),
+            remote_server: None,
+            remote_token: None,
+            remote_client_id: None,
         });
     }
     let body = fs::read_to_string(&path)?;

@@ -1,0 +1,32 @@
+[package]
+name = "shardx-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared ShardX logic: Chromium os_crypt cookie/secret encryption and portable user-data-dir snapshots (Mac/Win/Linux)."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+sha2 = "0.10"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tar = "0.4"
+flate2 = "1"
+
+# POSIX os_crypt: AES-128-CBC with a fixed IV.
+[target.'cfg(not(windows))'.dependencies]
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+pbkdf2 = "0.12"
+sha1 = "0.10"
+
+# Windows os_crypt: AES-256-GCM with a DPAPI-unwrapped key from Local State.
+[target.'cfg(windows)'.dependencies]
+aes-gcm = "0.10"
+getrandom = "0.2"
+base64 = "0.22"
+serde_json = "1"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }

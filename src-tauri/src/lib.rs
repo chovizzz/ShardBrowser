@@ -13,6 +13,7 @@ mod psapi;
 mod runtime;
 mod settings;
 mod store;
+mod sync;
 
 use serde_json::Value;
 
@@ -1108,6 +1109,124 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+// ---- Team Server sync (Phase 4) ----
+
+#[tauri::command]
+fn remote_get_config() -> Result<Value, String> {
+    let s = settings::load().map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "server": s.remote_server,
+        "has_token": s.remote_token.as_deref().map(|t| !t.is_empty()).unwrap_or(false),
+        "client_id": s.remote_client_id,
+    }))
+}
+
+fn ensure_client_id(s: &mut settings::Settings) {
+    if s.remote_client_id.as_deref().unwrap_or("").is_empty() {
+        s.remote_client_id = Some(uuid::Uuid::new_v4().to_string());
+    }
+}
+
+#[tauri::command]
+fn remote_set_config(server: Option<String>, token: Option<String>) -> Result<(), String> {
+    let mut s = settings::load().map_err(|e| e.to_string())?;
+    if let Some(sv) = server {
+        s.remote_server = Some(sv.trim_end_matches('/').to_string());
+    }
+    if let Some(tk) = token {
+        s.remote_token = Some(tk);
+    }
+    ensure_client_id(&mut s);
+    settings::save(&s).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn remote_login(server: String, username: String, password: String) -> Result<Value, String> {
+    let token = sync::login(&server, &username, &password)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut s = settings::load().map_err(|e| e.to_string())?;
+    s.remote_server = Some(server.trim_end_matches('/').to_string());
+    s.remote_token = Some(token);
+    ensure_client_id(&mut s);
+    settings::save(&s).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "ok": true }))
+}
+
+#[tauri::command]
+fn remote_logout() -> Result<(), String> {
+    let mut s = settings::load().map_err(|e| e.to_string())?;
+    s.remote_token = None;
+    settings::save(&s).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn remote_me() -> Result<Value, String> {
+    sync::me().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn remote_force_unlock(env_id: String) -> Result<Value, String> {
+    sync::force_unlock(&env_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn remote_list_envs() -> Result<Value, String> {
+    sync::list_envs().await.map_err(|e| e.to_string())
+}
+
+/// Materialize (or refresh) a local profile mirroring a remote environment, so
+/// the normal launch path can check it out. Returns the local profile id
+/// (which equals the remote env id). The launch hook does the actual pull.
+#[tauri::command]
+async fn remote_open(env_id: String) -> Result<String, String> {
+    let detail = sync::get_env(&env_id).await.map_err(|e| e.to_string())?;
+    let mut config = detail
+        .get("config")
+        .and_then(|c| c.as_object())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(name) = detail.get("name").and_then(|n| n.as_str()) {
+        config.insert("name".into(), Value::String(name.to_string()));
+    }
+    let mut stored = profile::StoredProfile {
+        meta: profile::StoredMeta {
+            id: env_id.clone(),
+            remote_env_id: Some(env_id.clone()),
+            folder: "Remote".into(),
+            ..Default::default()
+        },
+        config,
+    };
+    profile::save_raw(&mut stored).map_err(|e| e.to_string())?;
+    Ok(env_id)
+}
+
+#[tauri::command]
+async fn remote_lock_status(env_id: String) -> Result<Value, String> {
+    sync::lock_status(&env_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn remote_pull(profile_id: String, env_id: String) -> Result<Value, String> {
+    sync::pull(&profile_id, &env_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn remote_push(profile_id: String, env_id: String) -> Result<Value, String> {
+    sync::push(&profile_id, &env_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn remote_lease(env_id: String) -> Result<Value, String> {
+    sync::lease(&env_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn remote_release(env_id: String) -> Result<Value, String> {
+    sync::release(&env_id).await.map_err(|e| e.to_string())
+}
+
 pub fn run() {
     tauri::Builder::default()
         // Must be the first plugin: a second launch focuses the running window.
@@ -1194,6 +1313,19 @@ pub fn run() {
             runtime::runtime_status,
             runtime::runtime_install,
             runtime::launcher_update_check,
+            remote_get_config,
+            remote_set_config,
+            remote_login,
+            remote_logout,
+            remote_me,
+            remote_force_unlock,
+            remote_list_envs,
+            remote_open,
+            remote_lock_status,
+            remote_pull,
+            remote_push,
+            remote_lease,
+            remote_release,
         ])
         .setup(|app| {
             let _ = APP_HANDLE.set(app.handle().clone());
