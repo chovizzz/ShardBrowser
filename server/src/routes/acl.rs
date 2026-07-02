@@ -35,6 +35,14 @@ pub async fn grant(
     .bind(perm)
     .execute(&app.db)
     .await?;
+    crate::audit::log(
+        &app.db,
+        Some(&user.id),
+        "acl_grant",
+        (req.object_kind == "env").then_some(req.object_id.as_str()),
+        &format!("{} {}:{} perm={}", req.user_id, req.object_kind, req.object_id, perm),
+    )
+    .await;
     Ok(Json(json!({
         "granted": true,
         "user_id": req.user_id,
@@ -59,5 +67,13 @@ pub async fn revoke(
     if res.rows_affected() == 0 {
         return Err(AppError::NotFound);
     }
+    crate::audit::log(
+        &app.db,
+        Some(&user.id),
+        "acl_revoke",
+        (req.object_kind == "env").then_some(req.object_id.as_str()),
+        &format!("{} {}:{}", req.user_id, req.object_kind, req.object_id),
+    )
+    .await;
     Ok(Json(json!({ "revoked": true })))
 }
