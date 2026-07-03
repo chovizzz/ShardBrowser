@@ -65,6 +65,18 @@ pub struct StoredMeta {
     /// checks it back in (push + release) on close.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_env_id: Option<String>,
+    /// Secret from the active checkout; lease/checkin/release must present it.
+    /// Set at pull, cleared once the environment is checked back in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_lock_token: Option<String>,
+    /// Server snapshot version this checkout was based on. A retry-push only
+    /// overwrites when the server is still at this version (else: conflict).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_base_version: Option<i64>,
+    /// True when the browser exited but checkin failed — local user-data-dir
+    /// holds un-pushed changes the user can retry.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub remote_pending_push: bool,
 }
 
 fn is_false(b: &bool) -> bool {

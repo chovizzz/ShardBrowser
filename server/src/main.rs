@@ -1,3 +1,4 @@
+mod audit;
 mod auth;
 mod blob;
 mod config;
@@ -11,7 +12,6 @@ mod util;
 use std::net::SocketAddr;
 use std::str::FromStr;
 
-use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
@@ -28,6 +28,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = Config::from_env();
+    if cfg.admin_pass == "admin" {
+        tracing::warn!(
+            "SHARDX_ADMIN_PASS is the default 'admin' — anyone reaching this \
+             server can take it over; set a real password before exposing it"
+        );
+    }
     let pool = db::init_pool(&cfg).await?;
     db::bootstrap_admin(&pool, &cfg).await?;
 
@@ -35,9 +41,9 @@ async fn main() -> anyhow::Result<()> {
         db: pool,
         cfg: cfg.clone(),
     };
-    let app = routes::router(state)
-        .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive());
+    // No CORS layer on purpose: the only client is the desktop launcher
+    // (reqwest, no Origin). Browser-origin access stays blocked by default.
+    let app = routes::router(state).layer(TraceLayer::new_for_http());
 
     let addr = SocketAddr::from_str(&cfg.bind)?;
     let listener = tokio::net::TcpListener::bind(addr).await?;

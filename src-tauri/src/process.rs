@@ -97,10 +97,7 @@ impl Tracker {
                 .and_then(|p| p.meta.remote_env_id)
             {
                 if crate::sync::is_configured() {
-                    match crate::sync::push(&profile_id, &env_id).await {
-                        Ok(_) => eprintln!("[launcher] checked in shared environment {env_id}"),
-                        Err(e) => eprintln!("[launcher] checkin failed for env {env_id}: {e}"),
-                    }
+                    crate::sync::checkin_on_exit(&profile_id, &env_id).await;
                 }
             }
             // Bump the persisted total runtime; non-temporary only (temp

@@ -19,6 +19,12 @@ launcher 之外新增一个**自建中心服务器**:集中存放环境配置 + 
 | Phase 3 | `shared/`(`shardx-core`):os_crypt v10 加解密 + 跨机重加密 + 快照打包(排缓存) | ✅ 9/9 单测 |
 | Phase 4 | 启动器接入:`sync.rs`(pull/push/lease)、launch/退出钩子、`remote_*` 命令、`App.tsx` Team 视图 | ✅ build + e2e |
 | Phase 5 | TeamView 占用状态展示 + 管理员 Force-unlock、文档收尾 | ✅ build 门禁 |
+| 加固 | 安全审查后修复：ACL perm 强制 + folder 递归、代理凭据脱敏、锁 token/原子性、改密码+审计+token 失效、pull/push 恢复+sha256 校验 | ✅ 3 e2e 回归 |
+
+> **加固说明**:一次安全审查发现原实现虽功能齐全,但权限模型(perm 字段未强制、folder 不
+> 递归)、敏感数据(代理明文对全体成员)、锁一致性(无 token、非原子)、数据丢失路径(push 失败
+> 静默)均有缺口。已逐项修复,见 §4.2 的锁与会话安全说明、§7 的威胁模型。剩余待办:传输 TLS
+> 告警、unpack 原子化(见 §7)。
 
 **端到端自动化测试**:`server/tests/e2e_sync.rs` 拉起真实 server,用与 `sync.rs` 一致的
 reqwest multipart + `shardx_core` 跑通 checkout→checkin→download→unpack,断言 cookie 跨 udd 存活、缓存排除。
@@ -141,31 +147,44 @@ audit_log(id, actor_user_id, action, env_id, at, detail)
 ### 4.2 API
 
 ```
-POST /auth/login                  → { token, role }
+POST /auth/login                  → { token, role }；登录失败写审计
 GET  /me
+POST /me/password                 → 验旧密码改密；bump token_version（旧 token 立即失效）→ 返回新 token
 
 # 管理员
 GET  /users ; POST /users ; DELETE /users/{id}
 PATCH /users/{id}/role
-POST /acl                         → 给用户分配 env / folder 访问权
+PATCH /users/{id}/password        → 管理员重置密码（同样使旧 token 失效）
+POST /acl                         → 给用户分配 env / folder 访问权（perm: use|edit）
 POST /envs/{id}/force-unlock
+GET  /audit                       → 审计查询（limit / env_id / action 过滤）
 
 # 文件夹 / 代理
-GET/POST/PATCH/DELETE /folders
-GET/POST/DELETE /proxies
+GET/POST/PATCH/DELETE /folders     → GET 按 ACL 过滤；PATCH 改父级防环
+GET/POST/DELETE /proxies           → GET：admin 全量，member 仅脱敏（id/name/kind）
 
 # 环境
-GET  /envs                        → 按 ACL 过滤
-GET  /envs/{id}
+GET  /envs                        → 按 ACL 过滤（folder 授权递归覆盖后代）
+GET  /envs/{id}                    → 命中时内联绑定代理的完整凭据（member 唯一可见路径）
 POST /envs ; PATCH /envs/{id} ; DELETE /envs/{id}
+                                     PATCH：有 edit perm 的 member 可改 name/notes/config；
+                                     folder/proxy/host_os 改绑仍 admin-only
+                                     create/delete 仍 admin-only
 
 # 借出 / 归还(核心)
-POST /envs/{id}/checkout          → 加锁 + { version, snapshot_url };占用中→409+占用人
-POST /envs/{id}/lease             → 续租心跳
-POST /envs/{id}/checkin (multipart)→ 上传快照 → version+1 → 解锁
-POST /envs/{id}/release           → 丢弃改动并解锁
-GET  /envs/{id}/snapshot/{version}
+POST /envs/{id}/checkout          → 原子加锁 + { lock_token, version, snapshot_url, stale_takeover }
+                                     占用中→409+占用人；接管过期锁→stale_takeover=true+前任
+POST /envs/{id}/lease             → 续租心跳（需 lock_token；重校验 ACL）
+POST /envs/{id}/checkin (multipart)→ 需 lock_token；事务内条件解锁 → version+1
+POST /envs/{id}/release           → 需 lock_token；丢弃改动并解锁
+GET  /envs/{id}/snapshot/{version} → 仅当前持锁方或 admin 可下载；写审计
 ```
+
+**锁与会话安全**：`checkout` 用单条条件 upsert 原子抢锁（无 read-then-write 窗口），只在
+无锁 / 已过期 / 同 owner 时成功；返回一次性 `lock_token`，后续 lease/checkin/release 全部
+校验它——崩溃或被接管的旧会话无法再写。`checkin` 在事务内做条件删锁（owner+client+token），
+`rows_affected != 1` 即冲突；快照先写临时 blob，事务定版后再 rename 到最终路径，两个并发
+checkin 不会互相覆盖。撤销 ACL 会立即中断续租/归还（这些操作重跑 `load_accessible`）。
 
 ### 4.3 部署
 
@@ -203,8 +222,23 @@ Token 签名密钥、存储路径、(可选)S3 端点。
 
 ## 7. 已知风险 / 待定
 
-- **Login Data 范围**:多数站点登录态在 cookie 里,保存的密码(Login Data)优先级低,
-  可在 Phase 3 视情况决定是否纳入首版。
+- **快照含明文 cookie（威胁模型）**:快照为跨机可移植,内部存的是**解密后的明文 cookie**
+  (§2.1)。因此“能下载某环境快照”≈“能离线导出该环境登录态”。已把下载收紧为**仅当前
+  持锁方或 admin**,并写审计;但持锁期间导出无法从协议层阻止。部署须假设有权 use 某环境
+  的成员即可获得其登录态——按此分配 ACL。若需更强隔离,后续可对快照做服务端信封加密
+  (仅按需下发)或改为端到端加密。
+- **传输安全(TLS)**:登录密码、JWT、代理凭据、快照明文都走 HTTP。**生产必须在反代后启用
+  HTTPS**。客户端已加明文告警:`sync::insecure_transport_warning` 检测非 loopback 的 `http://`,
+  TeamView 在用户输入服务器地址时实时红字提示,登录成功后再 toast 一次(`remote_transport_warning`
+  命令 + `remote_login` 响应的 `insecure_transport` 字段)。https 或 localhost/127.0.0.1/::1 不告警。
+- **Login Data(保存的密码)不纳入首版**:多数站点登录态在 cookie 里。`Login Data` 用机器
+  绑定密钥加密、跨机不可移植,快照**排除**它(`snapshot.rs` EXCLUDE 列表),`PortableState.logins`
+  留空。如需纳入,须像 cookie 一样解密成明文再于目标机重建。
+- **unpack 原子化(已完成)**:快照先解到同级 `<id>.incoming` 暂存目录、在其中重建 Cookies,
+  成功后再 rename 交换进 `user-data/<id>/`(旧目录先移到 `<id>.backup`,二次 rename 失败会回滚)。
+  失败/崩溃只留下可被下次清理的暂存目录,现有 udd 不受影响;全量替换同时清除了远端已删除的
+  本地残留文件。交换时**保留本机 `Local State`**(机器绑定的 os_crypt key),避免用新 key 覆盖
+  后本机已加密的 Web Data(自动填充)失效——Windows 上关键,macOS/Linux 上 key 固定故为空操作。
 - **快照体积**:若某些环境 IndexedDB 很大,可在 Phase 2 后引入增量/分块(内容寻址)
   降低上传量;首版用整包压缩。
 - **跨 OS 指纹一致性**:一个环境的指纹固定声明某个 OS;成员在不同 host OS 上运行同一

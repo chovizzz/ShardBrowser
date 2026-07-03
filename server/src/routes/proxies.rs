@@ -2,20 +2,31 @@ use axum::extract::{Path, State};
 use axum::Json;
 use serde_json::{json, Value};
 
+use crate::audit;
 use crate::auth::AuthUser;
 use crate::error::AppError;
 use crate::models::{CreateProxyReq, Proxy};
 use crate::state::AppState;
 use crate::util;
 
+/// Admins get full entries. Members get a sanitized list (id/name/kind) —
+/// proxy endpoints and credentials reach a member only through
+/// `GET /envs/{id}` for an env they can access.
 pub async fn list(
     State(app): State<AppState>,
-    _user: AuthUser,
-) -> Result<Json<Vec<Proxy>>, AppError> {
+    user: AuthUser,
+) -> Result<Json<Vec<Value>>, AppError> {
     let rows = sqlx::query_as::<_, Proxy>("SELECT * FROM proxies ORDER BY name")
         .fetch_all(&app.db)
         .await?;
-    Ok(Json(rows))
+    let out = if user.is_admin() {
+        rows.iter()
+            .map(|p| serde_json::to_value(p).unwrap_or(Value::Null))
+            .collect()
+    } else {
+        rows.iter().map(|p| p.sanitized()).collect()
+    };
+    Ok(Json(out))
 }
 
 pub async fn create(
@@ -40,6 +51,7 @@ pub async fn create(
     .bind(&now)
     .execute(&app.db)
     .await?;
+    audit::log(&app.db, Some(&user.id), "proxy_create", None, &req.name).await;
     Ok(Json(Proxy {
         id,
         name: req.name,
@@ -65,5 +77,6 @@ pub async fn delete(
     if res.rows_affected() == 0 {
         return Err(AppError::NotFound);
     }
+    audit::log(&app.db, Some(&user.id), "proxy_delete", None, &id).await;
     Ok(Json(json!({ "deleted": id })))
 }

@@ -14,7 +14,10 @@ pub async fn init_pool(cfg: &Config) -> anyhow::Result<SqlitePool> {
 
     let opts = SqliteConnectOptions::from_str(&format!("sqlite://{}", cfg.db_path))?
         .create_if_missing(true)
-        .foreign_keys(true);
+        .foreign_keys(true)
+        // Writers queue instead of failing fast when a checkin transaction
+        // briefly holds the write lock.
+        .busy_timeout(std::time::Duration::from_secs(5));
     let pool = SqlitePoolOptions::new()
         .max_connections(8)
         .connect_with(opts)
