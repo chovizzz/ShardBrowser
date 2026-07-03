@@ -12,7 +12,11 @@
 #
 # Triggers:
 #   * pushing a tag like `v1.2.3`  → release named "ShardX Launcher v1.2.3"
-#   * manual dispatch via the Actions tab (handy for ad-hoc builds)
+#   * manual dispatch via the Actions tab, passing the tag to publish. The tag
+#     must already exist (the build checks it out), so create + push it first:
+#       git tag -a v1.2.3 -m ... && git push origin v1.2.3
+#     then run the workflow with tag=v1.2.3. Use this if a tag push doesn't
+#     auto-start the workflow.
 #
 # Artifacts attached to the Release:
 #   * macOS arm64 — .dmg + .app.tar.gz
@@ -61,6 +65,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # On a tag push this resolves to the tag. On manual dispatch, check
+          # out the tag the user named (not whatever main points at now) so we
+          # build the tagged commit — the tag must already exist. Keeps the
+          # built version in sync with the release name.
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Set up Node 20
         uses: actions/setup-node@v4
@@ -99,6 +109,15 @@ jobs:
 
       - name: npm install
         run: npm ci
+
+      - name: Clear stale bundles from the restored cache
+        # `src-tauri/target` is cached and prefix-restored across versions
+        # (restore-keys), so a previous release's installers can linger in
+        # target/<target>/release/bundle. The Collect step globs that dir, so
+        # without this the release would carry BOTH the old and new version's
+        # bundles. Wipe it so only this build's output is collected.
+        shell: bash
+        run: rm -rf "src-tauri/target/${{ matrix.target }}/release/bundle"
 
       - name: Build Tauri bundle (unsigned)
         # No Apple Developer ID / Authenticode cert in this repo, so bundles
