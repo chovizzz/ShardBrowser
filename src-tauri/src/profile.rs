@@ -118,7 +118,7 @@ pub fn list_all() -> Result<Vec<ProfileMeta>> {
             if let Some(ts) = mtime {
                 stored.meta.created_at = Some(ts);
                 if let Ok(body) = serde_json::to_string_pretty(&stored) {
-                    let _ = fs::write(&path, body);
+                    let _ = store::write_private(&path, body);
                 }
             }
         }
@@ -282,7 +282,8 @@ pub fn save_raw(stored: &mut StoredProfile) -> Result<()> {
     fill_noise_seeds(&mut stored.config, &stored.meta.id);
     let path = path_for(&stored.meta.id)?;
     let body = serde_json::to_string_pretty(stored)?;
-    fs::write(path, body)?;
+    // Profile JSON carries the checkout lock_token — owner-only perms.
+    store::write_private(&path, body)?;
     Ok(())
 }
 
@@ -366,7 +367,7 @@ pub fn set_pin(id: &str, pinned: bool) -> Result<()> {
     p.meta.pinned = pinned;
     let path = path_for(&p.meta.id)?;
     let body = serde_json::to_string_pretty(&p)?;
-    fs::write(path, body)?;
+    store::write_private(&path, body)?;
     Ok(())
 }
 
@@ -376,7 +377,7 @@ pub fn set_folder(id: &str, folder: &str) -> Result<()> {
     p.meta.folder = folder.trim().to_string();
     let path = path_for(&p.meta.id)?;
     let body = serde_json::to_string_pretty(&p)?;
-    fs::write(path, body)?;
+    store::write_private(&path, body)?;
     Ok(())
 }
 
@@ -398,7 +399,7 @@ pub fn rename_folder(old: &str, new: &str) -> Result<usize> {
         if stored.meta.folder == old {
             stored.meta.folder = new.to_string();
             if let Ok(out) = serde_json::to_string_pretty(&stored) {
-                let _ = fs::write(entry.path(), out);
+                let _ = store::write_private(&entry.path(), out);
             }
             n += 1;
         }
@@ -426,7 +427,7 @@ pub fn delete_folder(name: &str, delete_profiles: bool) -> Result<usize> {
             } else {
                 stored.meta.folder = String::new();
                 if let Ok(out) = serde_json::to_string_pretty(&stored) {
-                    let _ = fs::write(entry.path(), out);
+                    let _ = store::write_private(&entry.path(), out);
                 }
             }
             n += 1;

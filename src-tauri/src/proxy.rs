@@ -72,7 +72,8 @@ pub fn load() -> Result<ProxyStore> {
 
 fn save(s: &ProxyStore) -> Result<()> {
     let body = serde_json::to_string_pretty(s)?;
-    fs::write(store::proxies_path()?, body)?;
+    // Proxy entries carry credentials — owner-only perms.
+    store::write_private(&store::proxies_path()?, body)?;
     Ok(())
 }
 

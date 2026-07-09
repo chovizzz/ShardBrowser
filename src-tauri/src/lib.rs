@@ -814,7 +814,8 @@ fn cookies_export(profile_id: String) -> Result<Vec<cookies::Cookie>, String> {
 fn cookies_export_to_file(profile_id: String, path: String) -> Result<usize, String> {
     let cookies = cookies::export(&profile_id).map_err(|e| e.to_string())?;
     let json = serde_json::to_string_pretty(&cookies).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    // Plaintext cookies — write owner-only by default (the user can widen it).
+    store::write_private(std::path::Path::new(&path), json).map_err(|e| e.to_string())?;
     Ok(cookies.len())
 }
 

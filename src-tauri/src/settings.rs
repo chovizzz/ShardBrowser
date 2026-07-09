@@ -100,6 +100,7 @@ pub fn ensure_secret() -> Result<Settings> {
 
 pub fn save(s: &Settings) -> Result<()> {
     let body = serde_json::to_string_pretty(s)?;
-    fs::write(store::settings_path()?, body)?;
+    // Holds the team-server bearer token — owner-only perms.
+    store::write_private(&store::settings_path()?, body)?;
     Ok(())
 }

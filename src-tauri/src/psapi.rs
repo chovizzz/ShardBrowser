@@ -33,7 +33,8 @@ pub fn load() -> Result<PsConfig> {
 }
 
 fn save(c: &PsConfig) -> Result<()> {
-    fs::write(store::psapi_path()?, serde_json::to_string_pretty(c)?)?;
+    // Holds the ProxyShard billing Bearer key — owner-only perms.
+    store::write_private(&store::psapi_path()?, serde_json::to_string_pretty(c)?)?;
     Ok(())
 }
 

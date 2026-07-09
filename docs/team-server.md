@@ -239,6 +239,12 @@ loopback bind 只告警不阻断。
 
 ## 7. 已知风险 / 待定
 
+- **客户端凭据落盘(0600,非加密)**:launcher 把 team-server bearer token(`settings.json`)、
+  每 profile 的 checkout `lock_token`(profile JSON)、代理凭据(`proxies.json`)、ProxyShard
+  billing key(`psapi.json`)明文存在配置目录,写入时经 `store::write_private` 设 Unix `0600`
+  (Windows 靠 `%APPDATA%` per-user ACL)。这只挡**同机其他用户读取**——不加密,且备份/云同步工具
+  可能不保留 POSIX mode,凭据仍可能随备份外泄。高价值场景可后续改用系统 keychain/Credential
+  Manager。`remote_logout` 清 token、`discard` 清 lock_token。
 - **快照含明文敏感数据（威胁模型）**:快照为跨机可移植,`shardx-portable.json` 里存的是
   **解密后的明文**——不仅是 cookie,还包括 `Web Data` 的支付/自动填充密文列(信用卡号、CVC、
   IBAN;见 §2.1 与 `webdata.rs`)。因此“能下载某环境快照”≈“能离线导出该环境登录态**及保存的

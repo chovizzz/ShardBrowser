@@ -343,7 +343,10 @@ fn migrate_dir_to(
         }
 
         if changed {
-            fs::write(&p, serde_json::to_string_pretty(&cfg)?)?;
+            // Profile JSON here can carry a lock_token — keep migrated files
+            // owner-only too (harmless for the fingerprint library that shares
+            // this path).
+            crate::store::write_private(&p, serde_json::to_string_pretty(&cfg)?)?;
             n += 1;
         }
     }
