@@ -659,3 +659,30 @@ async fn login_throttles_after_repeated_failures() {
     assert_eq!(r.status().as_u16(), 429, "locked out after repeated failures");
     assert!(r.headers().get("retry-after").is_some(), "429 carries Retry-After");
 }
+
+/// A predictable client error (a foreign-key violation from a bogus folder_id)
+/// maps to 400, not a 500 leaking SQL / constraint text.
+#[tokio::test]
+async fn bad_foreign_key_is_client_error_not_500() {
+    let port = 38086u16;
+    let data = std::env::temp_dir().join(format!("shardx-e2e-fk-{}", std::process::id()));
+    let _guard = spawn_server(&data, port);
+    let c = client();
+    wait_health(&c, port).await;
+    let admin = token(&c, port, "admin", "secret").await;
+
+    let r = c
+        .post(format!("{}/envs", base(port)))
+        .bearer_auth(&admin)
+        .json(&json!({ "name": "x", "folder_id": "does-not-exist" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 400, "FK violation → 400, not 500");
+    let body: Value = r.json().await.unwrap();
+    let err = body["error"].as_str().unwrap_or_default().to_lowercase();
+    assert!(
+        !err.contains("foreign key") && !err.contains("sql") && !err.contains("constraint"),
+        "error message must not leak DB internals: {err}"
+    );
+}
