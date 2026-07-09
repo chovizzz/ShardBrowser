@@ -43,13 +43,33 @@ impl LocalCrypt {
     }
 
     /// Decrypt a cookie's `encrypted_value`; legacy rows fall back to `plain`.
-    pub fn decrypt_cookie(&self, encrypted: &[u8], plain: &str) -> String {
+    /// A v10 blob that fails to decrypt yields an empty string (infallible form,
+    /// for best-effort callers). Snapshot packing uses [`Self::try_decrypt_cookie`]
+    /// so it can refuse instead.
+    pub fn decrypt_cookie(&self, encrypted: &[u8], plain: &str, host: &str) -> String {
+        self.try_decrypt_cookie(encrypted, plain, host).unwrap_or_default()
+    }
+
+    /// Like [`Self::decrypt_cookie`], but a v10 blob that fails to decrypt (or
+    /// whose host-bound prefix doesn't match) returns `None` (an error) rather
+    /// than silently yielding an empty/garbage value — so a snapshot pack can
+    /// fail instead of shipping a wiped or corrupt cookie. Legacy non-v10 rows
+    /// still fall back to `plain`.
+    pub fn try_decrypt_cookie(&self, encrypted: &[u8], plain: &str, host: &str) -> Option<String> {
         match unframe_v10(encrypted) {
-            None => plain.to_string(),
-            Some(body) => match cipher::decrypt(&self.key, body) {
-                Some(pt) => String::from_utf8_lossy(&strip_host_prefix(pt)).into_owned(),
-                None => String::new(),
-            },
+            None => Some(plain.to_string()),
+            Some(body) => {
+                let pt = cipher::decrypt(&self.key, body)?;
+                // Plaintext is SHA256(host) || value. The POSIX cipher is AES-CBC
+                // (unauthenticated), so a wrong key can pass PKCS#7 padding and
+                // yield garbage — verify the host-bound prefix to reject that
+                // fail-closed instead of packing a corrupt value.
+                let expect = Sha256::digest(host.as_bytes());
+                if pt.len() < 32 || pt[..32] != expect[..] {
+                    return None;
+                }
+                Some(String::from_utf8_lossy(&pt[32..]).into_owned())
+            }
         }
     }
 
@@ -77,13 +97,6 @@ fn unframe_v10(blob: &[u8]) -> Option<&[u8]> {
     } else {
         None
     }
-}
-
-fn strip_host_prefix(mut pt: Vec<u8>) -> Vec<u8> {
-    if pt.len() >= 32 {
-        pt.drain(0..32);
-    }
-    pt
 }
 
 // ---- per-OS key derivation ----
@@ -291,15 +304,26 @@ mod tests {
         let key_b = LocalCrypt::with_key(vec![2u8; 16]);
 
         let blob_a = key_a.encrypt_cookie("example.com", "session=abc123");
-        let plain = key_a.decrypt_cookie(&blob_a, "");
+        let plain = key_a.decrypt_cookie(&blob_a, "", "example.com");
         assert_eq!(plain, "session=abc123");
 
         // Re-key: encrypt the recovered plaintext under a different key.
         let blob_b = key_b.encrypt_cookie("example.com", &plain);
         assert_ne!(blob_a, blob_b, "different keys → different ciphertext");
-        assert_eq!(key_b.decrypt_cookie(&blob_b, ""), "session=abc123");
+        assert_eq!(key_b.decrypt_cookie(&blob_b, "", "example.com"), "session=abc123");
         // The wrong key must not recover it.
-        assert_ne!(key_a.decrypt_cookie(&blob_b, ""), "session=abc123");
+        assert_ne!(key_a.decrypt_cookie(&blob_b, "", "example.com"), "session=abc123");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn wrong_host_rejects_cookie() {
+        let c = LocalCrypt::with_key(vec![9u8; 16]);
+        let blob = c.encrypt_cookie("example.com", "v=1");
+        // Right host decrypts; a wrong host is rejected fail-closed (not garbage).
+        assert_eq!(c.decrypt_cookie(&blob, "", "example.com"), "v=1");
+        assert_eq!(c.decrypt_cookie(&blob, "", "evil.com"), "");
+        assert!(c.try_decrypt_cookie(&blob, "", "evil.com").is_none());
     }
 
     #[test]
@@ -309,7 +333,7 @@ mod tests {
         let c = LocalCrypt::open(&dir).unwrap();
         let blob = c.encrypt_cookie("sub.example.com", "tok=ZZZ");
         assert_eq!(&blob[..3], b"v10");
-        assert_eq!(c.decrypt_cookie(&blob, ""), "tok=ZZZ");
+        assert_eq!(c.decrypt_cookie(&blob, "", "sub.example.com"), "tok=ZZZ");
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -325,6 +349,6 @@ mod tests {
     #[test]
     fn legacy_plain_fallback() {
         let c = LocalCrypt::with_key(vec![3u8; 16]);
-        assert_eq!(c.decrypt_cookie(b"not-v10-bytes", "legacy"), "legacy");
+        assert_eq!(c.decrypt_cookie(b"not-v10-bytes", "legacy", "example.com"), "legacy");
     }
 }

@@ -82,10 +82,16 @@ fn is_excluded(rel: &str) -> bool {
 /// Pack `udd` into compressed, portable snapshot bytes.
 pub fn pack(udd: &Path) -> Result<Vec<u8>> {
     let crypt = LocalCrypt::open(udd)?;
-    let cookies = cookies::read(&cookies::cookies_db_path(udd), &crypt).unwrap_or_default();
+    // Fail the pack on a real read error rather than silently shipping empty
+    // state — an empty cookie/secret set would clobber the shared environment's
+    // login/payment data on the next pull. (A profile with no such data reads as
+    // an empty-but-Ok vec, which is fine; only genuine failures error here.)
+    let cookies = cookies::read(&cookies::cookies_db_path(udd), &crypt)
+        .context("read cookies for snapshot")?;
     // Decrypt Web Data secrets (card numbers etc.) with THIS machine's key so
     // they can be re-sealed on the destination; the raw DB itself still travels.
-    let web_secrets = webdata::read(&webdata::web_data_path(udd), &crypt).unwrap_or_default();
+    let web_secrets = webdata::read(&webdata::web_data_path(udd), &crypt)
+        .context("read Web Data secrets for snapshot")?;
     let state = PortableState { cookies, logins: Vec::new(), web_secrets };
     let state_json = serde_json::to_vec(&state)?;
 
@@ -267,6 +273,7 @@ fn build_staging(bytes: &[u8], udd: &Path, staging: &Path) -> Result<PortableSta
 
     let mut total: u64 = 0;
     let mut count: usize = 0;
+    let mut saw_portable = false;
     // A pending GNU-longname body names the *next* file entry (paths >100 bytes,
     // e.g. long IndexedDB origins). We resolve it ourselves — see below.
     let mut pending_long_name: Option<String> = None;
@@ -340,7 +347,10 @@ fn build_staging(bytes: &[u8], udd: &Path, staging: &Path) -> Result<PortableSta
             }
             let mut s = String::new();
             e.read_to_string(&mut s)?;
-            state = serde_json::from_str(&s).unwrap_or_default();
+            // A corrupt portable blob must fail loudly — treating it as empty
+            // would rebuild an EMPTY cookie DB, silently wiping the login state.
+            state = serde_json::from_str(&s).context("parse portable snapshot state")?;
+            saw_portable = true;
             continue;
         }
         if is_excluded(&rel) {
@@ -364,6 +374,12 @@ fn build_staging(bytes: &[u8], udd: &Path, staging: &Path) -> Result<PortableSta
     // A longname with no following entry means a truncated/crafted archive.
     if pending_long_name.is_some() {
         bail!("snapshot ends with a dangling longname header — refusing");
+    }
+    // Every snapshot pack() produces embeds the portable state first. Its absence
+    // means a truncated/corrupt archive — refuse rather than rebuild empty
+    // cookies over the local ones.
+    if !saw_portable {
+        bail!("snapshot is missing its portable state (shardx-portable.json) — refusing");
     }
 
     // Carry over this machine's existing os_crypt key (if any) so we don't
@@ -538,6 +554,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let dst = base.join("dst");
         assert!(unpack(&bytes, &dst).is_err(), "oversized extension header must be rejected");
+    }
+
+    #[test]
+    fn unpack_rejects_missing_or_corrupt_portable_state() {
+        let base = std::env::temp_dir().join(format!("shardx-snap-portable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        // (a) No portable state at all → refuse (don't rebuild empty cookies).
+        {
+            let gz = GzEncoder::new(Vec::new(), Compression::default());
+            let mut tar = tar::Builder::new(gz);
+            let mut h = tar::Header::new_gnu();
+            h.set_size(3);
+            h.set_mode(0o644);
+            h.set_cksum();
+            tar.append_data(&mut h, "Default/x", &b"abc"[..]).unwrap();
+            let bytes = tar.into_inner().unwrap().finish().unwrap();
+            assert!(unpack(&bytes, &base.join("a")).is_err(), "missing portable state rejected");
+        }
+
+        // (b) Present but not valid JSON → refuse (don't silently wipe cookies).
+        {
+            let gz = GzEncoder::new(Vec::new(), Compression::default());
+            let mut tar = tar::Builder::new(gz);
+            let bad = b"{ not valid json";
+            let mut h = tar::Header::new_gnu();
+            h.set_size(bad.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            tar.append_data(&mut h, PORTABLE_FILE, &bad[..]).unwrap();
+            let bytes = tar.into_inner().unwrap().finish().unwrap();
+            assert!(unpack(&bytes, &base.join("b")).is_err(), "corrupt portable state rejected");
+        }
     }
 
     #[test]

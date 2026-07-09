@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OpenFlags};
 
 use crate::oscrypt::LocalCrypt;
@@ -71,41 +71,46 @@ pub fn read(db_path: &Path, crypt: &LocalCrypt) -> Result<Vec<PortableCookie>> {
          is_secure, is_httponly, has_expires, samesite, top_frame_site_key, \
          source_scheme, source_port, has_cross_site_ancestor FROM cookies",
     )?;
+    // Read the raw row (incl. `encrypted_value` + plaintext fallback), then
+    // decrypt OUTSIDE the rusqlite closure so a v10 decrypt failure can abort the
+    // read instead of silently packing an empty cookie value.
     let rows = stmt.query_map([], |r| {
-        let host: String = r.get(0)?;
-        let name: String = r.get(1)?;
         let plain: String = r.get(2)?;
         let enc: Vec<u8> = r.get(3)?;
-        let path: String = r.get(4)?;
-        let expires_utc: i64 = r.get(5)?;
-        let is_secure: i64 = r.get(6)?;
-        let is_httponly: i64 = r.get(7)?;
         let has_expires: i64 = r.get(8)?;
-        let samesite: i64 = r.get(9)?;
-        Ok(PortableCookie {
-            value: crypt.decrypt_cookie(&enc, &plain),
-            domain: host,
-            name,
-            path,
+        let cookie = PortableCookie {
+            value: String::new(), // filled below
+            domain: r.get(0)?,
+            name: r.get(1)?,
+            path: r.get(4)?,
             expires: if has_expires != 0 {
-                Some(chromium_to_unix_secs(expires_utc))
+                Some(chromium_to_unix_secs(r.get(5)?))
             } else {
                 None
             },
-            secure: is_secure != 0,
-            http_only: is_httponly != 0,
-            same_site: Some(samesite_to_str(samesite).to_string()),
+            secure: r.get::<_, i64>(6)? != 0,
+            http_only: r.get::<_, i64>(7)? != 0,
+            same_site: Some(samesite_to_str(r.get(9)?).to_string()),
             // Preserve the unique-index components so partitioned cookies restore
             // to the exact same scope rather than collapsing together.
             top_frame_site_key: r.get(10)?,
             source_scheme: Some(r.get(11)?),
             source_port: Some(r.get(12)?),
             has_cross_site_ancestor: Some(r.get(13)?),
-        })
+        };
+        Ok((enc, plain, cookie))
     })?;
     let mut out = Vec::new();
-    for c in rows {
-        out.push(c?);
+    for row in rows {
+        let (enc, plain, mut cookie) = row?;
+        cookie.value = crypt.try_decrypt_cookie(&enc, &plain, &cookie.domain).ok_or_else(|| {
+            anyhow!(
+                "cookie {}={} failed v10 decryption — refusing to pack an empty value",
+                cookie.domain,
+                cookie.name
+            )
+        })?;
+        out.push(cookie);
     }
     Ok(out)
 }
@@ -245,6 +250,21 @@ mod tests {
         assert_eq!(u.value, "unpartitioned");
         assert_eq!(p.value, "partitioned-to-shop");
         assert_eq!(p.top_frame_site_key, "https://shop.example");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn read_fails_on_undecryptable_v10_cookie() {
+        // A v10 cookie sealed with key A can't be read with key B — that must
+        // error, not silently pack an empty value (which would wipe the cookie).
+        let dir = std::env::temp_dir().join(format!("shardx-ckbad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("Cookies");
+        let key_a = LocalCrypt::with_key(vec![0xAA; 16]);
+        let key_b = LocalCrypt::with_key(vec![0xBB; 16]);
+        write(&db, &key_a, &[sample(".acme.test", "auth", "TOKEN")]).unwrap();
+        assert!(read(&db, &key_b).is_err(), "undecryptable v10 cookie must error");
     }
 
     // Prove the snapshot re-key path at the DB level: write under key A, read
