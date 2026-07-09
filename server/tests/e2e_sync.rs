@@ -44,8 +44,8 @@ async fn wait_health(c: &reqwest::Client, port: u16) {
     panic!("server did not become healthy on port {port}");
 }
 
-/// Spawn a server on a fresh data dir. Lease TTL is 1s so the stale-takeover
-/// test doesn't have to wait the default 90s.
+/// Spawn a server on a fresh data dir. The stale-takeover test ages the lease
+/// row directly (the server floors the TTL at 15s), so this uses a normal TTL.
 fn spawn_server(data: &std::path::Path, port: u16) -> ServerGuard {
     let _ = std::fs::remove_dir_all(data);
     let bin = env!("CARGO_BIN_EXE_shardx-team-server");
@@ -56,7 +56,7 @@ fn spawn_server(data: &std::path::Path, port: u16) -> ServerGuard {
         .env("SHARDX_ADMIN_USER", "admin")
         .env("SHARDX_ADMIN_PASS", "secret")
         .env("SHARDX_SNAPSHOT_KEEP", "3")
-        .env("SHARDX_LEASE_TTL_SECS", "1")
+        .env("SHARDX_LEASE_TTL_SECS", "20")
         .spawn()
         .expect("spawn server binary");
     ServerGuard(child)
@@ -403,8 +403,23 @@ async fn stale_lock_takeover_and_password_invalidation() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 409, "live lease blocks others");
 
-    // lease TTL is 1s; wait it out, then bob takes over
-    tokio::time::sleep(Duration::from_millis(1300)).await;
+    // Expire alice's lease by aging the row directly — the server floors the
+    // TTL at 15s, too long to wait out in a test — then bob takes over.
+    {
+        use std::str::FromStr;
+        let db = data.join("shardx.db");
+        let opts = sqlx::sqlite::SqliteConnectOptions::from_str(&format!("sqlite://{}", db.display()))
+            .unwrap()
+            .busy_timeout(Duration::from_secs(5));
+        let pool = sqlx::SqlitePool::connect_with(opts).await.unwrap();
+        let n = sqlx::query("UPDATE locks SET lease_expires_at = '2000-01-01T00:00:00+00:00'")
+            .execute(&pool)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(n, 1, "aged exactly alice's lease");
+        pool.close().await;
+    }
     let b: Value = c
         .post(format!("{}/envs/{env_id}/checkout", base(port)))
         .bearer_auth(&bob)
