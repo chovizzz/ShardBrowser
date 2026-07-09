@@ -36,6 +36,17 @@ pub struct PortableLogin {
     pub signon_realm: String,
 }
 
+/// A decrypted `Web Data` secret (a credit-card number, CVC, or IBAN), carried
+/// in a snapshot so it can be re-sealed with the destination machine's os_crypt
+/// key on restore. `table` + `key` (the row's `guid`) locate the exact row to
+/// rewrite; `value` is the raw decrypted bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortableSecret {
+    pub table: String,
+    pub key: String,
+    pub value: Vec<u8>,
+}
+
 /// The plaintext, portable slice of a profile's state embedded in a snapshot
 /// (everything that is machine-bound-encrypted on disk).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -44,6 +55,10 @@ pub struct PortableState {
     pub cookies: Vec<PortableCookie>,
     #[serde(default)]
     pub logins: Vec<PortableLogin>,
+    /// `Web Data` os_crypt secrets, re-sealed in place on restore (the raw DB
+    /// travels with the snapshot; only its encrypted columns need rekeying).
+    #[serde(default)]
+    pub web_secrets: Vec<PortableSecret>,
 }
 
 /// Filename of the portable state blob inside a snapshot archive.

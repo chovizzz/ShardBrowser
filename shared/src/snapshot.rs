@@ -18,6 +18,7 @@ use flate2::Compression;
 use crate::cookies;
 use crate::oscrypt::LocalCrypt;
 use crate::portable::{PortableState, PORTABLE_FILE};
+use crate::webdata;
 
 /// Relative-path prefixes excluded from snapshots (cache, transient state, and
 /// machine-bound files we reconstruct on restore).
@@ -57,6 +58,12 @@ fn is_excluded(rel: &str) -> bool {
         }
     }
     let base = rel.rsplit('/').next().unwrap_or(rel);
+    // Drop rollback journals (transient), but KEEP SQLite `-wal`/`-shm`: after a
+    // hard-kill checkin the main DB may not be checkpointed, so committed rows
+    // can live only in the WAL — carrying it lets the destination replay them.
+    // For `Web Data` specifically the source-key card frames it may hold are
+    // harmless: unpack re-keys those rows in place and then checkpoint-truncates
+    // the WAL, so the restored profile ends up clean and destination-keyed.
     if base.ends_with("-journal") {
         return true;
     }
@@ -76,7 +83,10 @@ fn is_excluded(rel: &str) -> bool {
 pub fn pack(udd: &Path) -> Result<Vec<u8>> {
     let crypt = LocalCrypt::open(udd)?;
     let cookies = cookies::read(&cookies::cookies_db_path(udd), &crypt).unwrap_or_default();
-    let state = PortableState { cookies, logins: Vec::new() };
+    // Decrypt Web Data secrets (card numbers etc.) with THIS machine's key so
+    // they can be re-sealed on the destination; the raw DB itself still travels.
+    let web_secrets = webdata::read(&webdata::web_data_path(udd), &crypt).unwrap_or_default();
+    let state = PortableState { cookies, logins: Vec::new(), web_secrets };
     let state_json = serde_json::to_vec(&state)?;
 
     let gz = GzEncoder::new(Vec::new(), Compression::default());
@@ -234,6 +244,12 @@ fn build_staging(bytes: &[u8], udd: &Path, staging: &Path) -> Result<PortableSta
     let crypt = LocalCrypt::open(staging)?;
     let db = cookies::cookies_db_path(staging);
     cookies::write(&db, &crypt, &state.cookies)?;
+
+    // Re-seal Web Data secrets (card numbers etc.) with this machine's key. The
+    // raw DB traveled in the snapshot; only its encrypted columns are rekeyed in
+    // place, keyed by each row's guid — the rest of its tables are left intact.
+    webdata::reencrypt_in_place(&webdata::web_data_path(staging), &crypt, &state.web_secrets)
+        .context("re-encrypt Web Data secrets")?;
     Ok(state)
 }
 
@@ -320,6 +336,45 @@ mod tests {
     fn rejects_path_traversal() {
         assert!(safe_join(Path::new("/tmp/x"), "../../etc/passwd").is_err());
         assert!(safe_join(Path::new("/tmp/x"), "Default/ok").is_ok());
+    }
+
+    #[test]
+    fn pack_unpack_normalizes_web_data_secrets() {
+        // End-to-end wiring: a Web Data card sealed in the source udd survives
+        // pack→unpack and is re-sealed so the destination key decrypts it. (The
+        // cross-key correctness itself is covered by webdata's own unit test;
+        // here the on-OS os_crypt key is fixed, so this proves the wiring.)
+        let base = std::env::temp_dir().join(format!("shardx-snap-wd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let dst = base.join("dst");
+        std::fs::create_dir_all(src.join("Default")).unwrap();
+
+        let scrypt = LocalCrypt::open(&src).unwrap();
+        {
+            let conn = rusqlite::Connection::open(src.join("Default/Web Data")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE credit_cards (guid TEXT PRIMARY KEY, name_on_card TEXT, \
+                 card_number_encrypted BLOB);",
+            )
+            .unwrap();
+            let enc = scrypt.encrypt_secret(b"4111111111111111");
+            conn.execute(
+                "INSERT INTO credit_cards VALUES ('g1', 'Ada', ?1)",
+                rusqlite::params![enc],
+            )
+            .unwrap();
+        }
+
+        let bytes = pack(&src).unwrap();
+        let state = unpack(&bytes, &dst).unwrap();
+        assert_eq!(state.web_secrets.len(), 1, "card carried in portable state");
+
+        // The Web Data DB traveled, and the card decrypts with dst's key.
+        let dcrypt = LocalCrypt::open(&dst).unwrap();
+        let cards = webdata::read(&webdata::web_data_path(&dst), &dcrypt).unwrap();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].value, b"4111111111111111");
     }
 
     #[test]

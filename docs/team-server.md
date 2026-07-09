@@ -111,8 +111,10 @@ reqwest multipart + `shardx_core` 跑通 checkout→checkin→download→unpack,
 同一环境同一时刻只允许一人运行,否则并发登录会让登录态互相覆盖、触发风控。
 
 **租约式锁(防客户端崩溃死锁)**
-- `checkout` 原子加锁,返回带 TTL 的租约(默认 90s)+ 最新快照版本/下载地址。
-- 客户端运行期间每 30s 调 `/lease` 续租。
+- `checkout` 原子加锁,返回带 TTL 的租约(默认 90s,服务端最小 15s)+ 最新快照
+  版本/下载地址;响应含 `lease_ttl_secs` 供客户端计算续租节奏。
+- 客户端在续租响应里读到 TTL,按 ~TTL/3 调 `/lease` 续租(而非固定间隔),覆盖
+  pull 下载/解包、浏览器运行、push 打包上传全程,使短 TTL 也不会在续租前过期。
 - 客户端崩溃 → 租约到期 → 管理员可 `force-unlock`,或自动回收;回收时环境标记
   "可能有未提交改动",由原借出方确认。
 - `checkin` 上传新快照 → version+1 → 释放锁;`release` 丢弃改动并释放锁。
@@ -222,11 +224,12 @@ Token 签名密钥、存储路径、(可选)S3 端点。
 
 ## 7. 已知风险 / 待定
 
-- **快照含明文 cookie（威胁模型）**:快照为跨机可移植,内部存的是**解密后的明文 cookie**
-  (§2.1)。因此“能下载某环境快照”≈“能离线导出该环境登录态”。已把下载收紧为**仅当前
-  持锁方或 admin**,并写审计;但持锁期间导出无法从协议层阻止。部署须假设有权 use 某环境
-  的成员即可获得其登录态——按此分配 ACL。若需更强隔离,后续可对快照做服务端信封加密
-  (仅按需下发)或改为端到端加密。
+- **快照含明文敏感数据（威胁模型）**:快照为跨机可移植,`shardx-portable.json` 里存的是
+  **解密后的明文**——不仅是 cookie,还包括 `Web Data` 的支付/自动填充密文列(信用卡号、CVC、
+  IBAN;见 §2.1 与 `webdata.rs`)。因此“能下载某环境快照”≈“能离线导出该环境登录态**及保存的
+  支付信息**”。已把下载收紧为**仅当前持锁方或 admin**,并写审计;但持锁期间导出无法从协议层
+  阻止。部署须假设有权 use 某环境的成员即可获得其登录态与支付数据——按此分配 ACL,并务必启用
+  下面的传输 TLS。若需更强隔离,后续可对快照做服务端信封加密(仅按需下发)或改为端到端加密。
 - **传输安全(TLS)**:登录密码、JWT、代理凭据、快照明文都走 HTTP。**生产必须在反代后启用
   HTTPS**。客户端已加明文告警:`sync::insecure_transport_warning` 检测非 loopback 的 `http://`,
   TeamView 在用户输入服务器地址时实时红字提示,登录成功后再 toast 一次(`remote_transport_warning`
@@ -237,8 +240,17 @@ Token 签名密钥、存储路径、(可选)S3 端点。
 - **unpack 原子化(已完成)**:快照先解到同级 `<id>.incoming` 暂存目录、在其中重建 Cookies,
   成功后再 rename 交换进 `user-data/<id>/`(旧目录先移到 `<id>.backup`,二次 rename 失败会回滚)。
   失败/崩溃只留下可被下次清理的暂存目录,现有 udd 不受影响;全量替换同时清除了远端已删除的
-  本地残留文件。交换时**保留本机 `Local State`**(机器绑定的 os_crypt key),避免用新 key 覆盖
-  后本机已加密的 Web Data(自动填充)失效——Windows 上关键,macOS/Linux 上 key 固定故为空操作。
+  本地残留文件。交换时**保留本机 `Local State`**(机器绑定的 os_crypt key)。
+- **Web Data(支付/自动填充)跨机归一化(已完成)**:`Web Data` 原 SQLite 随快照打包,但其
+  加密列(`credit_cards.card_number_encrypted`、`local_stored_cvc`/`local_ibans` 的
+  `value_encrypted`)用源机 key 加密、跨机不可解。`webdata.rs` 在 pack 时用源机 key 解密进
+  `PortableState.web_secrets`,unpack 时按行 `guid` **就地用目标机 key 重加密**(不重建整个
+  多表 schema),重加密后 best-effort `wal_checkpoint(TRUNCATE)` 把结果折叠进主库(正确性不依赖
+  它:即便 checkpoint 失败,后写入的目标 key frame 仍在 WAL 里、目标引擎读到的也是新值)(SQLite
+  `-wal`/`-shm` 随快照保留,以免硬杀 checkin 时未 checkpoint 的已提交行丢失)。仅覆盖**本地、
+  guid 键**的支付数据;账号/服务器绑定项(`unmasked_credit_cards`、
+  `server_stored_cvc`、`token_service`)登录后由账号重新同步,故不纳入。解不出的行跳过(残留孤儿,
+  无害)。
 - **快照体积**:若某些环境 IndexedDB 很大,可在 Phase 2 后引入增量/分块(内容寻址)
   降低上传量;首版用整包压缩。
 - **跨 OS 指纹一致性**:一个环境的指纹固定声明某个 OS;成员在不同 host OS 上运行同一
