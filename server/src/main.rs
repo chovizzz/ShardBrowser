@@ -37,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let pool = db::init_pool(&cfg).await?;
     db::bootstrap_admin(&pool, &cfg).await?;
+    blob::gc_orphans(&cfg, &pool).await;
 
     let state = AppState {
         db: pool,

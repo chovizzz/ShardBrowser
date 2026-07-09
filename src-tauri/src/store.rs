@@ -62,21 +62,34 @@ pub fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
     {
         use std::io::Write;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        // New files are created 0600. For an EXISTING file we do NOT truncate in
-        // the open — instead we tighten the mode on the fd FIRST, then truncate
-        // and write, so the new secret is never held in a world-readable file
-        // (and chmod goes through the fd, avoiding a path-based race).
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("open {}", path.display()))?;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        f.set_len(0)?;
-        let mut f = f;
-        f.write_all(contents)?;
-        f.flush()?;
+        // Write a sibling temp at 0600, fsync, then atomically rename it over the
+        // target. Rename replaces the inode, so a reader sees the whole old or
+        // whole new file (never a partial write), an FD held on the old inode
+        // can't observe the new secret, and the new content is never briefly
+        // world-readable.
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let tmp = parent.join(format!(
+            ".{}.{}.tmp",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("cred"),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let write_tmp = || -> Result<()> {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)
+                .with_context(|| format!("create {}", tmp.display()))?;
+            // Force exact 0600 (mode(0o600) alone is still filtered by umask).
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            f.write_all(contents)?;
+            f.sync_all()?;
+            Ok(())
+        };
+        if let Err(e) = write_tmp().and_then(|()| Ok(std::fs::rename(&tmp, path)?)) {
+            let _ = std::fs::remove_file(&tmp); // don't leave a stray temp behind
+            return Err(e);
+        }
     }
     #[cfg(not(unix))]
     {
