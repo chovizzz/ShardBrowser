@@ -153,7 +153,8 @@ pub async fn checkout(
 ) -> Result<Json<Value>, AppError> {
     let client = client_id(&body);
     let presented = lock_token(&body);
-    let env = load_accessible(&app, &user, &id, Perm::Use).await?;
+    // Enforce access; the version is re-read after the lock is acquired below.
+    load_accessible(&app, &user, &id, Perm::Use).await?;
 
     // Snapshot of the previous holder, only for the 409 message / takeover
     // flag; the upsert condition below is the actual arbiter.
@@ -203,6 +204,16 @@ pub async fn checkout(
         )));
     }
 
+    // Re-read the version now that the lock is OURS — no concurrent checkin can
+    // move it anymore. A checkin that committed between `load_accessible` above
+    // and this upsert would otherwise hand us a stale version + snapshot_url, and
+    // our own next checkin would clobber that work.
+    let current_version: i64 =
+        sqlx::query_scalar("SELECT current_version FROM environments WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&app.db)
+            .await?;
+
     // We won the slot. If someone else's expired lease was sitting there, the
     // previous session may hold un-pushed local changes — surface that to the
     // caller and the audit trail instead of silently swallowing it.
@@ -230,8 +241,8 @@ pub async fn checkout(
         "lock_token": token,
         "lease_expires_at": expires,
         "lease_ttl_secs": app.cfg.lease_ttl_secs,
-        "version": env.current_version,
-        "snapshot_url": snapshot_url(&id, env.current_version),
+        "version": current_version,
+        "snapshot_url": snapshot_url(&id, current_version),
         "stale_takeover": stale_takeover,
     });
     if stale_takeover {

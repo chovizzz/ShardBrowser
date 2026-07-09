@@ -333,6 +333,13 @@ pub fn clone_profile(id: &str) -> Result<ProfileMeta> {
     src.meta.last_launched_at = None;
     src.meta.created_at = None;
     src.meta.pinned = false;
+    // A clone is a fresh, independent local profile — never inherit the source's
+    // remote binding or checkout session, or the copy could reuse the source's
+    // lock_token to steal/interrupt its live remote checkout.
+    src.meta.remote_env_id = None;
+    src.meta.remote_lock_token = None;
+    src.meta.remote_base_version = None;
+    src.meta.remote_pending_push = false;
     src.config
         .insert("name".into(), serde_json::Value::String(format!("{old_name} (copy)")));
     // Re-randomize CPU/RAM/platform_version so the copy doesn't collide on those axes.

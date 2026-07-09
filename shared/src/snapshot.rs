@@ -23,6 +23,10 @@ use crate::webdata;
 /// Relative-path prefixes excluded from snapshots (cache, transient state, and
 /// machine-bound files we reconstruct on restore).
 const EXCLUDE_PREFIXES: &[&str] = &[
+    // Machine-bound os_crypt key — the destination mints its own. Prefix-excluded
+    // (not just the exact file) so a crafted `Local State/foo` can't create a
+    // directory at the protected path and abort the restore.
+    "Local State",
     "Default/Cache",
     "Default/Code Cache",
     "Default/GPUCache",
@@ -48,16 +52,23 @@ const EXCLUDE_PREFIXES: &[&str] = &[
     "extensions_crx_cache",
 ];
 
+/// Exclusion match. Comparisons are ASCII-case-insensitive: Windows and the
+/// default macOS filesystem are case-insensitive, so `local state` /
+/// `Default/login data` would alias the excluded (and never-rebuilt) machine-key
+/// and Login Data files. Callers pass the canonical `rel` from `normalize_rel`,
+/// so `.`/empty/leading-root variants are already collapsed before we get here.
 fn is_excluded(rel: &str) -> bool {
-    if rel == "Local State" {
-        return true; // machine-bound os_crypt key — destination mints its own
-    }
     for p in EXCLUDE_PREFIXES {
-        if rel == *p || rel.starts_with(&format!("{p}/")) {
+        let (rb, pb) = (rel.as_bytes(), p.as_bytes());
+        // Exact, or a `p/` prefix. The `rb[pb.len()] == b'/'` guard makes
+        // `pb.len()` a char boundary, so the slice below never splits a codepoint.
+        if rel.eq_ignore_ascii_case(p)
+            || (rb.len() > pb.len() && rb[pb.len()] == b'/' && rel[..pb.len()].eq_ignore_ascii_case(p))
+        {
             return true;
         }
     }
-    let base = rel.rsplit('/').next().unwrap_or(rel);
+    let base = rel.rsplit('/').next().unwrap_or(rel).to_ascii_lowercase();
     // Drop rollback journals (transient), but KEEP SQLite `-wal`/`-shm`: after a
     // hard-kill checkin the main DB may not be checkpointed, so committed rows
     // can live only in the WAL — carrying it lets the destination replay them.
@@ -68,14 +79,14 @@ fn is_excluded(rel: &str) -> bool {
         return true;
     }
     matches!(
-        base,
-        "LOCK"
+        base.as_str(),
+        "lock"
             | "lockfile"
-            | "SingletonLock"
-            | "SingletonCookie"
-            | "SingletonSocket"
-            | "DevToolsActivePort"
-            | ".DS_Store"
+            | "singletonlock"
+            | "singletoncookie"
+            | "singletonsocket"
+            | "devtoolsactiveport"
+            | ".ds_store"
     )
 }
 
@@ -334,13 +345,20 @@ fn build_staging(bytes: &[u8], udd: &Path, staging: &Path) -> Result<PortableSta
         }
 
         // Prefer a pending GNU longname over the (truncated) ustar header name.
-        let rel = match pending_long_name.take() {
+        let raw_rel = match pending_long_name.take() {
             Some(n) => n,
             None => e.path()?.to_string_lossy().replace('\\', "/"),
         };
-        if rel.len() > MAX_PATH_BYTES {
+        if raw_rel.len() > MAX_PATH_BYTES {
             bail!("snapshot path exceeds {MAX_PATH_BYTES} bytes — refusing");
         }
+        // Canonicalize ONCE, then match and extract on the same string. Otherwise
+        // a crafted path can take one spelling past the exact-string checks
+        // (`PORTABLE_FILE` / `is_excluded`) and a different, normalized spelling to
+        // disk — e.g. `./Local State`, `Local State/`, `/Local State`,
+        // `Default/./Network/Cookies` all collapse here so they can't plant an
+        // excluded file or a portable-state stand-in.
+        let rel = normalize_rel(&raw_rel)?;
         if rel == PORTABLE_FILE {
             if size > MAX_PORTABLE_BYTES {
                 bail!("snapshot portable state exceeds {MAX_PORTABLE_BYTES} bytes — refusing");
@@ -412,9 +430,28 @@ fn sibling(udd: &Path, suffix: &str) -> Result<PathBuf> {
     Ok(udd.with_file_name(format!("{name}.{suffix}")))
 }
 
-/// Join an archive-relative path under `root`, rejecting traversal.
-fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
-    let mut out = root.to_path_buf();
+/// Windows reserved device name (case-insensitive, ignoring any extension):
+/// `NUL`, `CON`, `COM1`, … — these don't behave as literal files on Windows.
+fn is_windows_reserved(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL"
+            | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
+            | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+    )
+}
+
+/// Canonicalize an archive path to its `/`-joined normal form, rejecting anything
+/// that isn't a plain relative chain of file/dir names. `.` and empty segments
+/// (leading root, `//`, trailing `/`) are dropped so a crafted spelling can't
+/// slip a different form past the exact-string checks in `build_staging`; `..`,
+/// a colon / Windows drive-prefix, a trailing dot/space, or a reserved device
+/// name (`NUL`, `COM1`, …) are refused outright. The returned string is what
+/// both the exclusion match AND `safe_join` operate on — one path, one meaning.
+fn normalize_rel(rel: &str) -> Result<String> {
+    use std::path::Component;
+    let mut parts: Vec<&str> = Vec::new();
     for comp in rel.split('/') {
         if comp.is_empty() || comp == "." {
             continue;
@@ -422,9 +459,34 @@ fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
         if comp == ".." {
             bail!("unsafe path in archive: {rel}");
         }
-        out.push(comp);
+        // A colon flags a Windows drive/ADS even on Unix; `components()` catches
+        // a platform-specific prefix/root; trailing dot/space and reserved device
+        // names behave non-literally on Windows. Require exactly one plain Normal
+        // segment — Chromium profile paths need nothing else.
+        let is_plain_name = !comp.contains(':')
+            && !comp.ends_with('.')
+            && !comp.ends_with(' ')
+            && !is_windows_reserved(comp)
+            && matches!(
+                Path::new(comp).components().collect::<Vec<_>>().as_slice(),
+                [Component::Normal(_)]
+            );
+        if !is_plain_name {
+            bail!("unsafe path component in archive: {rel}");
+        }
+        parts.push(comp);
     }
-    Ok(out)
+    if parts.is_empty() {
+        bail!("empty path in archive: {rel}");
+    }
+    Ok(parts.join("/"))
+}
+
+/// Join a canonical (already `normalize_rel`-validated) path under `root`. Kept
+/// as a thin final guard: re-normalizes as defense-in-depth so a future caller
+/// that forgets to normalize can't escape `root`.
+fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
+    Ok(root.join(normalize_rel(rel)?))
 }
 
 #[cfg(test)]
@@ -487,6 +549,86 @@ mod tests {
     fn rejects_path_traversal() {
         assert!(safe_join(Path::new("/tmp/x"), "../../etc/passwd").is_err());
         assert!(safe_join(Path::new("/tmp/x"), "Default/ok").is_ok());
+        // Windows drive / prefix / colon segments must be refused on every OS
+        // (they'd escape `root` via PathBuf::push on Windows).
+        assert!(safe_join(Path::new("/tmp/x"), "C:/evil").is_err());
+        assert!(safe_join(Path::new("/tmp/x"), "C:evil").is_err());
+        assert!(safe_join(Path::new("/tmp/x"), "Default/a:b").is_err());
+        // Windows trailing dot/space are stripped by the OS, so `Local State.`
+        // resolves to the excluded `Local State` — reject the whole shape.
+        assert!(safe_join(Path::new("/tmp/x"), "Local State.").is_err());
+        assert!(safe_join(Path::new("/tmp/x"), "Cookies ").is_err());
+        // Reserved device names don't behave as literal files on Windows.
+        assert!(safe_join(Path::new("/tmp/x"), "NUL").is_err());
+        assert!(safe_join(Path::new("/tmp/x"), "CON").is_err());
+        assert!(safe_join(Path::new("/tmp/x"), "COM1").is_err());
+        assert!(safe_join(Path::new("/tmp/x"), "Default/LPT1.txt").is_err());
+    }
+
+    #[test]
+    fn unpack_canonicalizes_paths_before_matching() {
+        // Non-literal spellings that normalize onto a protected target must be
+        // matched on their canonical form — a leading `/`, a `.` segment, a
+        // trailing `/`, or an ASCII case variant must not carry attacker bytes
+        // past the exact-string exclusion / portable-state checks and onto disk.
+        // The literal tar Builder rejects absolute names, so the vector is a GNU
+        // longname carrying the crafted path.
+        let evil_marker = b"ATTACKER-CONTROLLED";
+        let evil_names = [
+            "/Local State",             // leading root → excluded machine key
+            "./Local State",            // `.` segment → same
+            "Default/./Login Data",     // interior `.` → excluded, never rebuilt
+            "local state",              // case alias on Win/macOS
+            "Default/login data",       // case alias, excluded
+            "Default/Network/Cookies/", // trailing slash
+            "Local State/foo",          // dir at the protected file path
+        ];
+
+        let gz = GzEncoder::new(Vec::new(), Compression::default());
+        let mut tar = tar::Builder::new(gz);
+
+        // Valid portable state first, so unpack reaches its success path.
+        let state = PortableState { cookies: vec![], logins: vec![], web_secrets: vec![] };
+        let state_json = serde_json::to_vec(&state).unwrap();
+        let mut ph = tar::Header::new_gnu();
+        ph.set_size(state_json.len() as u64);
+        ph.set_mode(0o644);
+        ph.set_cksum();
+        tar.append_data(&mut ph, PORTABLE_FILE, &state_json[..]).unwrap();
+
+        for evil in evil_names {
+            // Longname header renaming the following entry to the crafted path.
+            let mut lh = tar::Header::new_gnu();
+            lh.set_entry_type(tar::EntryType::GNULongName);
+            let mut name = evil.as_bytes().to_vec();
+            name.push(0);
+            lh.set_size(name.len() as u64);
+            lh.set_mode(0o644);
+            lh.set_cksum();
+            tar.append(&lh, &name[..]).unwrap();
+
+            let mut h = tar::Header::new_gnu();
+            h.set_size(evil_marker.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            tar.append_data(&mut h, "Default/placeholder", &evil_marker[..]).unwrap();
+        }
+        let bytes = tar.into_inner().unwrap().finish().unwrap();
+
+        let base = std::env::temp_dir().join(format!("shardx-snap-canon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dst = base.join("dst");
+        // Unpack succeeds (valid portable state); the crafted entries are matched
+        // on their canonical form and dropped as excluded — none plants its marker.
+        unpack(&bytes, &dst).unwrap();
+        for planted in ["Local State", "Default/Login Data", "Default/login data"] {
+            let p = dst.join(planted);
+            if let Ok(got) = std::fs::read(&p) {
+                assert_ne!(got, evil_marker, "canonicalized path planted attacker bytes at {planted}");
+            }
+        }
+        // The prefix exclusion also blocks a directory at the protected path.
+        assert!(!dst.join("Local State/foo").exists(), "excluded prefix planted a child");
     }
 
     #[test]

@@ -35,7 +35,7 @@ pub async fn create(
     if req.username.trim().is_empty() || req.password.is_empty() {
         return Err(AppError::BadRequest("username and password required".into()));
     }
-    let hash = auth::hash_password(&req.password)?;
+    let hash = auth::hash_slot(&app, req.password).await?;
     let id = util::new_id();
     let res = sqlx::query(
         "INSERT INTO users (id, username, pw_hash, role, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -91,7 +91,7 @@ pub async fn reset_password(
     if req.password.is_empty() {
         return Err(AppError::BadRequest("password required".into()));
     }
-    let hash = auth::hash_password(&req.password)?;
+    let hash = auth::hash_slot(&app, req.password).await?;
     let res = sqlx::query(
         "UPDATE users SET pw_hash = ?, token_version = token_version + 1 WHERE id = ?",
     )

@@ -456,6 +456,12 @@ fn profile_import(payloads: Vec<Value>) -> Result<usize, String> {
             match obj.get_mut("_meta").and_then(|m| m.as_object_mut()) {
                 Some(meta) => {
                     meta.insert("id".into(), Value::String(String::new()));
+                    // An imported profile is a fresh local one — never inherit a
+                    // remote binding or checkout session from the payload, or the
+                    // import could reuse someone's lock_token.
+                    for k in ["remote_env_id", "remote_lock_token", "remote_base_version", "remote_pending_push"] {
+                        meta.remove(k);
+                    }
                 }
                 None => {
                     obj.insert("_meta".into(), serde_json::json!({ "id": "" }));

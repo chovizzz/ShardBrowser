@@ -35,6 +35,24 @@ pub fn verify_password(password: &str, hash: &str) -> Result<(), AppError> {
         .map_err(|_| AppError::Unauthorized)
 }
 
+/// Argon2 is CPU-heavy by design; run every hash/verify under the shared login
+/// throttle (bounds concurrency → 429 when saturated) and on the blocking pool
+/// (so it never ties up an async worker). Every password-touching route MUST go
+/// through these, not the sync `hash_password`/`verify_password` directly.
+pub async fn verify_slot(app: &AppState, password: String, hash: String) -> Result<bool, AppError> {
+    let _slot = app.login_throttle.try_verify_slot().ok_or(AppError::TooManyRequests(1))?;
+    tokio::task::spawn_blocking(move || verify_password(&password, &hash).is_ok())
+        .await
+        .map_err(|e| AppError::Internal(format!("verify task: {e}")))
+}
+
+pub async fn hash_slot(app: &AppState, password: String) -> Result<String, AppError> {
+    let _slot = app.login_throttle.try_verify_slot().ok_or(AppError::TooManyRequests(1))?;
+    tokio::task::spawn_blocking(move || hash_password(&password))
+        .await
+        .map_err(|e| AppError::Internal(format!("hash task: {e}")))?
+}
+
 // ---- JWT (HS256) ----
 
 #[derive(Serialize, Deserialize)]
@@ -179,20 +197,9 @@ pub async fn login(
         }
     };
 
-    // Bound concurrent Argon2 so a parallel first wave (all passing `locked_for`
-    // before any is recorded) can't exhaust CPU, and run it on the blocking pool
-    // so it never ties up an async worker. The permit is held across the await.
-    let verified = {
-        let _slot = app
-            .login_throttle
-            .try_verify_slot()
-            .ok_or(AppError::TooManyRequests(1))?;
-        let password = req.password.clone();
-        let hash = user.pw_hash.clone();
-        tokio::task::spawn_blocking(move || verify_password(&password, &hash).is_ok())
-            .await
-            .map_err(|e| AppError::Internal(format!("verify task: {e}")))?
-    };
+    // Throttled + off-runtime Argon2 (see `verify_slot`): bounds a concurrent
+    // first wave that all passed `locked_for` before any was recorded.
+    let verified = verify_slot(&app, req.password.clone(), user.pw_hash.clone()).await?;
     if !verified {
         app.login_throttle.record_failure(&ip, &user_key);
         let detail = format!("{} from {ip}", user.username);
@@ -231,8 +238,10 @@ pub async fn change_password(
     let row = db::find_user(&app.db, &user.id)
         .await?
         .ok_or(AppError::Unauthorized)?;
-    verify_password(&req.old_password, &row.pw_hash)?;
-    let hash = hash_password(&req.new_password)?;
+    if !verify_slot(&app, req.old_password, row.pw_hash.clone()).await? {
+        return Err(AppError::Unauthorized);
+    }
+    let hash = hash_slot(&app, req.new_password).await?;
     sqlx::query("UPDATE users SET pw_hash = ?, token_version = token_version + 1 WHERE id = ?")
         .bind(&hash)
         .bind(&user.id)
