@@ -19,10 +19,48 @@ pub struct PortableCookie {
     /// "Strict" | "Lax" | "None" | "unspecified" (case-insensitive).
     #[serde(default, alias = "sameSite")]
     pub same_site: Option<String>,
+    /// CHIPS partition key — the top-level site a partitioned cookie is scoped
+    /// to (empty for an unpartitioned cookie). It's part of the Chromium cookie
+    /// row's UNIQUE index, so it must round-trip or a partitioned cookie would
+    /// collide with (or widen into) the unpartitioned scope on restore.
+    #[serde(default)]
+    pub top_frame_site_key: String,
+    /// Unique-index component — 1 unless the cookie was set in a cross-site
+    /// context. `None` on legacy snapshots → written as 1 (the old default).
+    #[serde(default)]
+    pub has_cross_site_ancestor: Option<i64>,
+    /// Unique-index components. `None` on legacy snapshots → derived from
+    /// `secure` on write, matching the old rebuild behavior.
+    #[serde(default)]
+    pub source_scheme: Option<i64>,
+    #[serde(default)]
+    pub source_port: Option<i64>,
 }
 
 fn default_path() -> String {
     "/".to_string()
+}
+
+// Hand-written (not derived) so `path` defaults to "/" like the serde default,
+// rather than an empty string — this type is public and an empty path would be
+// an invalid cookie.
+impl Default for PortableCookie {
+    fn default() -> Self {
+        Self {
+            domain: String::new(),
+            name: String::new(),
+            value: String::new(),
+            path: default_path(),
+            expires: None,
+            secure: false,
+            http_only: false,
+            same_site: None,
+            top_frame_site_key: String::new(),
+            has_cross_site_ancestor: None,
+            source_scheme: None,
+            source_port: None,
+        }
+    }
 }
 
 /// Decrypted saved login (Chromium `Login Data` → `logins`). Reserved for a

@@ -311,6 +311,7 @@ mod tests {
                 secure: true,
                 http_only: true,
                 same_site: Some("Lax".into()),
+                ..Default::default()
             }],
         )
         .unwrap();
@@ -398,6 +399,7 @@ mod tests {
                 secure: true,
                 http_only: true,
                 same_site: Some("Lax".into()),
+                ..Default::default()
             }],
         )
         .unwrap();

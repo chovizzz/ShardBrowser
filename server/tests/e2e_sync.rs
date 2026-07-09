@@ -118,6 +118,7 @@ async fn checkout_checkin_snapshot_roundtrip() {
             secure: true,
             http_only: true,
             same_site: Some("Lax".into()),
+            ..Default::default()
         }],
     )
     .unwrap();
