@@ -626,12 +626,21 @@ async fn gc_snapshots(app: &AppState, env_id: &str, current: i64) {
     .fetch_all(&app.db)
     .await
     .unwrap_or_default();
-    for s in &stale {
-        blob::remove(&s.blob_path).await;
-    }
-    let _ = sqlx::query("DELETE FROM snapshots WHERE env_id = ? AND version <= ?")
+    // Delete the ROWS first, then the blob files. A crash between the two leaves
+    // orphan blobs (no row), which the orphan GC reclaims — recoverable. The
+    // reverse order would leave rows pointing at missing blobs, which download
+    // can't heal and would surface as a hard error. If the row delete fails we
+    // skip the blob removal entirely rather than orphan a row's data.
+    if sqlx::query("DELETE FROM snapshots WHERE env_id = ? AND version <= ?")
         .bind(env_id)
         .bind(cutoff)
         .execute(&app.db)
-        .await;
+        .await
+        .is_err()
+    {
+        return;
+    }
+    for s in &stale {
+        blob::remove(&s.blob_path).await;
+    }
 }

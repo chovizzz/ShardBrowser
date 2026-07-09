@@ -93,7 +93,33 @@ pub fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(path, contents)?;
+        use std::io::Write;
+        // Windows has no 0600 mode, but the atomicity still matters: write a
+        // sibling temp, fsync, then rename over the target so a reader never sees
+        // a half-written credential file and a crash mid-write can't truncate the
+        // existing one. `fs::rename` on Windows replaces the destination
+        // (MoveFileEx REPLACE_EXISTING) and is atomic on the same volume. The
+        // file inherits the parent dir's ACL, which under %APPDATA% is the user.
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let tmp = parent.join(format!(
+            ".{}.{}.tmp",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("cred"),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let write_tmp = || -> Result<()> {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .with_context(|| format!("create {}", tmp.display()))?;
+            f.write_all(contents)?;
+            f.sync_all()?;
+            Ok(())
+        };
+        if let Err(e) = write_tmp().and_then(|()| Ok(std::fs::rename(&tmp, path)?)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
     }
     Ok(())
 }

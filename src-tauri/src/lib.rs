@@ -404,6 +404,21 @@ pub fn save_profile_core(
 
     let mut stored: profile::StoredProfile =
         serde_json::from_value(payload).map_err(|e| e.to_string())?;
+    // The remote checkout binding (env id, lock token, base version, pending
+    // push) is owned by the launch/sync pipeline, NOT the profile editor. A
+    // generic UI save omits these fields, and serde's `default` would reset them
+    // to None/false — silently unlinking a checked-out profile, discarding a
+    // pending push, and stranding its server lock until lease expiry. Re-read the
+    // persisted values and carry them over on every save of an existing profile;
+    // a deliberate unlink goes through the dedicated remote command, not here.
+    if !is_new {
+        if let Ok(existing) = profile::load_raw(&stored.meta.id) {
+            stored.meta.remote_env_id = existing.meta.remote_env_id;
+            stored.meta.remote_lock_token = existing.meta.remote_lock_token;
+            stored.meta.remote_base_version = existing.meta.remote_base_version;
+            stored.meta.remote_pending_push = existing.meta.remote_pending_push;
+        }
+    }
     profile::save_raw(&mut stored).map_err(|e| e.to_string())?;
     let name = stored
         .config

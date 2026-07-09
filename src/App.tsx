@@ -1665,6 +1665,19 @@ function BrowsersView() {
     if (ids.length === 0) return;
     try {
       const payloads = await Promise.all(ids.map((id) => invoke<any>("profile_get", { id })));
+      // Never export the checkout session: remote_lock_token is a live secret
+      // (whoever holds it can pull the env's plaintext cookies/secrets), and the
+      // rest of the remote binding must not be inherited by an imported copy.
+      // Import strips these too, but sanitize on the way OUT so the secret never
+      // lands in the clipboard/JSON in the first place.
+      for (const p of payloads) {
+        if (p && p._meta) {
+          delete p._meta.remote_env_id;
+          delete p._meta.remote_lock_token;
+          delete p._meta.remote_base_version;
+          delete p._meta.remote_pending_push;
+        }
+      }
       await clip.write(JSON.stringify(payloads, null, 2));
       toast.ok(`Copied ${payloads.length} to clipboard`);
     } catch (e) { toast.err(String(e)); }
