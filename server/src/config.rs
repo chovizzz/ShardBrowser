@@ -43,7 +43,22 @@ impl Config {
         let admin_user = env_or("SHARDX_ADMIN_USER", "admin");
         let admin_pass = env_or("SHARDX_ADMIN_PASS", "admin");
 
-        let lease_ttl_secs = parse_env("SHARDX_LEASE_TTL_SECS", 90);
+        // Floor the lease TTL: clients renew at ~TTL/3, so too small a TTL (or a
+        // non-positive one, which would mint an already-expired lease) leaves a
+        // window where the lock lapses between renewals and a peer can steal it.
+        let lease_ttl_secs = {
+            const MIN_LEASE_TTL_SECS: i64 = 15;
+            let configured = parse_env("SHARDX_LEASE_TTL_SECS", 90);
+            if configured < MIN_LEASE_TTL_SECS {
+                tracing::warn!(
+                    "SHARDX_LEASE_TTL_SECS={configured} is below the {MIN_LEASE_TTL_SECS}s \
+                     minimum; clamping to {MIN_LEASE_TTL_SECS}s so clients can renew in time"
+                );
+                MIN_LEASE_TTL_SECS
+            } else {
+                configured
+            }
+        };
         let snapshot_keep = parse_env("SHARDX_SNAPSHOT_KEEP", 5);
         let max_snapshot_bytes = parse_env::<usize>("SHARDX_MAX_SNAPSHOT_BYTES", 512 * 1024 * 1024);
 

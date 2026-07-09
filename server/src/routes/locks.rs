@@ -128,6 +128,7 @@ pub async fn checkout(
         "client_id": client,
         "lock_token": token,
         "lease_expires_at": expires,
+        "lease_ttl_secs": app.cfg.lease_ttl_secs,
         "version": env.current_version,
         "snapshot_url": snapshot_url(&id, env.current_version),
         "stale_takeover": stale_takeover,
@@ -172,7 +173,11 @@ pub async fn lease(
             "you no longer hold this lock (expired, taken over, or bad token)".into(),
         ));
     }
-    Ok(Json(json!({ "env_id": id, "lease_expires_at": expires })))
+    Ok(Json(json!({
+        "env_id": id,
+        "lease_expires_at": expires,
+        "lease_ttl_secs": app.cfg.lease_ttl_secs,
+    })))
 }
 
 /// Upload a new snapshot (multipart: optional `client_id` + `lock_token`

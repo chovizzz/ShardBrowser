@@ -91,11 +91,54 @@ pub fn has_pending_push(profile_id: &str) -> bool {
     profile::load_raw(profile_id).map(|p| p.meta.remote_pending_push).unwrap_or(false)
 }
 
-/// Renew the checkout lease every 30s until the profile is no longer running.
+/// Renewal cadence derived from the server's lease TTL: renew at ~1/3 of the
+/// TTL so a single failed renewal still leaves two more attempts before the
+/// lease lapses. Clamped to [5s, 300s]. Falls back to 30s when the server
+/// doesn't report a TTL (older server predating the `lease_ttl_secs` field).
+fn renew_interval(ttl_secs: Option<i64>) -> std::time::Duration {
+    let secs = match ttl_secs {
+        Some(ttl) if ttl > 0 => (ttl / 3).clamp(5, 300),
+        _ => 30,
+    };
+    std::time::Duration::from_secs(secs as u64)
+}
+
+/// Pull the server's advertised lease TTL out of a checkout/lease response.
+fn lease_ttl_secs(v: &Value) -> Option<i64> {
+    v.get("lease_ttl_secs").and_then(|t| t.as_i64())
+}
+
+/// Interval until the next renewal, given the outcome of the last one. On
+/// success, track the server TTL (renew at ~TTL/3). On failure, back off to a
+/// short fixed retry rather than the TTL-derived cadence: a failed renewal must
+/// be retried quickly (a lost network blip shouldn't let a small TTL lapse),
+/// and we can't trust the (absent) response to tell us how long we may wait.
+fn interval_after(result: &Result<Value>) -> std::time::Duration {
+    match result {
+        Ok(v) => renew_interval(lease_ttl_secs(v)),
+        Err(_) => std::time::Duration::from_secs(5),
+    }
+}
+
+/// Renew the checkout lease until the profile is no longer running.
+///
+/// The cadence tracks the server's lease TTL (renew at ~TTL/3) rather than a
+/// fixed interval, so a short server-side `SHARDX_LEASE_TTL_SECS` can't let the
+/// lease lapse between renewals. An immediate renewal on spawn learns the TTL
+/// (checkout already set the lease, so this just refreshes it and reads the TTL
+/// back), and every subsequent renewal re-reads it in case the server was
+/// reconfigured mid-session. The launch path also holds a `LeaseGuard` across
+/// pre-spawn preflight, so the lease is already fresh when this takes over.
 pub fn spawn_lease_renewer(profile_id: String, env_id: String) {
     tokio::spawn(async move {
+        // Immediate renew learns the TTL and sets the first interval.
+        let res = lease(&profile_id, &env_id).await;
+        if let Err(e) = &res {
+            eprintln!("[launcher] initial lease renew failed for env {env_id}: {e}");
+        }
+        let mut interval = interval_after(&res);
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            tokio::time::sleep(interval).await;
             let still_running = crate::process::Tracker::shared()
                 .running()
                 .iter()
@@ -103,35 +146,37 @@ pub fn spawn_lease_renewer(profile_id: String, env_id: String) {
             if !still_running {
                 break;
             }
-            if let Err(e) = lease(&profile_id, &env_id).await {
+            let res = lease(&profile_id, &env_id).await;
+            if let Err(e) = &res {
                 eprintln!("[launcher] lease renew failed for env {env_id}: {e}");
             }
+            interval = interval_after(&res);
         }
     });
 }
 
-/// Keep a checkout lease alive for the duration of a (possibly slow) push.
-/// The process Tracker's renewer stops when the child exits, so a large
-/// snapshot pack+upload could otherwise outlive the lease. Dropped on return.
-struct LeaseGuard {
+/// Keep a checkout lease alive across a window where the browser's own renewer
+/// isn't running: launch preflight (proxy probe / geo resolve before spawn),
+/// the pull download+unpack, and a (possibly slow) push pack+upload. Renews
+/// immediately on start, then tracks the server TTL. Dropped to stop.
+pub struct LeaseGuard {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LeaseGuard {
-    fn start(profile_id: &str, env_id: &str) -> Self {
+    pub fn start(profile_id: &str, env_id: &str) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (pid, eid, flag) = (profile_id.to_string(), env_id.to_string(), stop.clone());
         tokio::spawn(async move {
-            // Renew immediately (the browser's own renewer already stopped),
-            // then every 15s — short enough to survive a small server TTL
-            // while a large snapshot packs and uploads.
-            let _ = lease(&pid, &eid).await;
+            // Renew immediately, learning the server TTL so the cadence tracks
+            // it (renew at ~TTL/3); a failed renew backs off to a short retry.
+            let mut interval = interval_after(&lease(&pid, &eid).await);
             while !flag.load(std::sync::atomic::Ordering::Relaxed) {
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                tokio::time::sleep(interval).await;
                 if flag.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                let _ = lease(&pid, &eid).await;
+                interval = interval_after(&lease(&pid, &eid).await);
             }
         });
         Self { stop }
@@ -334,6 +379,10 @@ pub async fn pull(profile_id: &str, env_id: &str) -> Result<Value> {
 
     let result: Result<()> = async {
         if let Some(url) = meta.get("snapshot_url").and_then(|u| u.as_str()) {
+            // Renew the lease across the download+unpack: the browser-side
+            // renewer only starts once the engine spawns, so a slow pull of a
+            // large snapshot could otherwise outlive the lease we just acquired.
+            let _guard = LeaseGuard::start(profile_id, env_id);
             let bytes = download(url).await?;
             let udd = profile::user_data_dir(profile_id)?;
             // pack/unpack do blocking fs + sqlite work; keep off the async runtime.
@@ -449,5 +498,40 @@ mod tests {
     fn plain_http_to_remote_host_warns() {
         assert!(warn("http://team.example.com:8080").is_some());
         assert!(warn("http://10.0.0.5:8080").is_some());
+    }
+
+    #[test]
+    fn renew_interval_tracks_ttl() {
+        use super::{lease_ttl_secs, renew_interval};
+        use serde_json::json;
+        // ~TTL/3, so a short server TTL renews before it lapses.
+        assert_eq!(renew_interval(Some(90)).as_secs(), 30); // default TTL
+        assert_eq!(renew_interval(Some(20)).as_secs(), 6); // small TTL renews often
+        // At the server-enforced minimum TTL (15s) the interval still beats it.
+        assert_eq!(renew_interval(Some(15)).as_secs(), 5);
+        assert!(renew_interval(Some(15)).as_secs() < 15);
+        // Clamped: never hammer, never drift too far.
+        assert_eq!(renew_interval(Some(6)).as_secs(), 5); // floor
+        assert_eq!(renew_interval(Some(3600)).as_secs(), 300); // ceiling
+        // Missing / bogus TTL falls back to a safe fixed cadence.
+        assert_eq!(renew_interval(None).as_secs(), 30);
+        assert_eq!(renew_interval(Some(0)).as_secs(), 30);
+        assert_eq!(renew_interval(Some(-5)).as_secs(), 30);
+        // Parses the field the server actually sends.
+        assert_eq!(lease_ttl_secs(&json!({ "lease_ttl_secs": 90 })), Some(90));
+        assert_eq!(lease_ttl_secs(&json!({ "env_id": "x" })), None);
+    }
+
+    #[test]
+    fn interval_after_backs_off_on_failure() {
+        use super::interval_after;
+        use serde_json::json;
+        // Success tracks the TTL...
+        assert_eq!(interval_after(&Ok(json!({ "lease_ttl_secs": 90 }))).as_secs(), 30);
+        // ...a success without the field falls back to the legacy 30s cadence...
+        assert_eq!(interval_after(&Ok(json!({ "env_id": "x" }))).as_secs(), 30);
+        // ...but a FAILED renewal retries quickly, never a wide fixed gap that a
+        // short TTL could outlast.
+        assert_eq!(interval_after(&Err(anyhow::anyhow!("network down"))).as_secs(), 5);
     }
 }
