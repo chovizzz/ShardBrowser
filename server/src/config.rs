@@ -22,7 +22,11 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Arc<Config> {
-        let bind = env_or("SHARDX_BIND", "0.0.0.0:8080");
+        // Default to loopback: bare-metal/dev is reachable only from the host,
+        // so a fresh install isn't exposed by accident. Exposing it is a
+        // deliberate `SHARDX_BIND=0.0.0.0` (the Docker image sets that), which
+        // then trips the default-admin-password guard in `bootstrap_admin`.
+        let bind = env_or("SHARDX_BIND", "127.0.0.1:8080");
         let data_dir = env_or("SHARDX_DATA_DIR", "./data");
         let trimmed = data_dir.trim_end_matches('/').to_string();
         let db_path = format!("{trimmed}/shardx.db");
@@ -76,6 +80,15 @@ impl Config {
             max_snapshot_bytes,
         })
     }
+
+    /// True if `bind` is a loopback address (reachable only from this host).
+    /// Non-loopback (or an unparseable host) is treated as network-facing.
+    pub fn bind_is_loopback(&self) -> bool {
+        self.bind
+            .parse::<std::net::SocketAddr>()
+            .map(|a| a.ip().is_loopback())
+            .unwrap_or(false)
+    }
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -84,4 +97,35 @@ fn env_or(key: &str, default: &str) -> String {
 
 fn parse_env<T: std::str::FromStr>(key: &str, default: T) -> T {
     std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with_bind(bind: &str) -> Config {
+        Config {
+            bind: bind.to_string(),
+            data_dir: String::new(),
+            db_path: String::new(),
+            blob_dir: String::new(),
+            token_secret: String::new(),
+            token_ttl_secs: 0,
+            admin_user: String::new(),
+            admin_pass: String::new(),
+            lease_ttl_secs: 0,
+            snapshot_keep: 0,
+            max_snapshot_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn loopback_detection() {
+        assert!(cfg_with_bind("127.0.0.1:8080").bind_is_loopback());
+        assert!(cfg_with_bind("[::1]:8080").bind_is_loopback());
+        // Network-facing (or unparseable) binds are treated as exposed.
+        assert!(!cfg_with_bind("0.0.0.0:8080").bind_is_loopback());
+        assert!(!cfg_with_bind("192.168.1.10:8080").bind_is_loopback());
+        assert!(!cfg_with_bind("localhost:8080").bind_is_loopback()); // not an IP literal
+    }
 }

@@ -193,6 +193,15 @@ checkin 不会互相覆盖。撤销 ACL 会立即中断续租/归还（这些操
 单 Docker 容器,挂载一个数据卷(`./data`)。配置走环境变量:监听地址、
 Token 签名密钥、存储路径、(可选)S3 端点。
 
+**安全默认**:裸机默认 `SHARDX_BIND=127.0.0.1:8080`(仅本机可达);Docker 镜像设为
+`0.0.0.0:8080`(经端口映射/反代暴露)。一旦 bind 非 loopback,服务器对**弱口令 admin
+拒绝启动**:① 首次 bootstrap 时口令为空/过短(<8)/占位符(admin、secret、change-me…)即
+`bail`;② 即使库里已有 admin(早先用 admin/admin 建过、或先 loopback 后改暴露),也会逐个
+对现有 admin 的 hash 校验占位符口令,命中即拒(已改强口令的放行;hash 无法还原长度,故只测
+占位符)。必须设强 `SHARDX_ADMIN_PASS`(并建议设 `SHARDX_TOKEN_SECRET` 让 token 跨重启
+有效)。确需暴露端口用弱口令(内网临时测试)可设 `SHARDX_ALLOW_INSECURE_ADMIN=1` 豁免。
+loopback bind 只告警不阻断。
+
 ---
 
 ## 5. 客户端改造(增量,不破坏单机模式)

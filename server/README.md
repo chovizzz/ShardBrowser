@@ -12,22 +12,27 @@ and (in later phases) exclusive checkout locks + environment-data snapshots.
 ## Run
 
 ```bash
-# dev
+# dev (binds 127.0.0.1 by default — loopback only, so a simple password is fine)
 cd server
-SHARDX_TOKEN_SECRET=dev-secret SHARDX_ADMIN_PASS=secret cargo run
+SHARDX_TOKEN_SECRET=dev-secret SHARDX_ADMIN_PASS=dev-strong-pass cargo run
 
-# docker
+# docker (binds 0.0.0.0 → network-facing, so a strong admin password is REQUIRED;
+# a weak/placeholder one makes first start refuse to boot)
 docker build -t shardx-team-server server/
 docker run -p 8080:8080 -v "$PWD/data:/data" \
   -e SHARDX_TOKEN_SECRET=$(openssl rand -hex 32) \
-  -e SHARDX_ADMIN_USER=admin -e SHARDX_ADMIN_PASS=secret \
+  -e SHARDX_ADMIN_USER=admin -e SHARDX_ADMIN_PASS="$(openssl rand -base64 18)" \
   shardx-team-server
 ```
 
 Config is all environment variables — see [`.env.example`](.env.example).
 SQLite DB + snapshot blobs live under `SHARDX_DATA_DIR` (`/data` in Docker).
 On first start with an empty user table, an admin is bootstrapped from
-`SHARDX_ADMIN_USER` / `SHARDX_ADMIN_PASS`.
+`SHARDX_ADMIN_USER` / `SHARDX_ADMIN_PASS`. On a **non-loopback bind** (e.g. the
+Docker default `0.0.0.0`), the server **refuses to start** if that password is
+empty, too short, or a known placeholder (`admin`, `secret`, `change-me`, …), or
+if an existing admin still uses one — set a strong `SHARDX_ADMIN_PASS`, bind
+`127.0.0.1`, or set `SHARDX_ALLOW_INSECURE_ADMIN=1` to override.
 
 ## API (Phase 1)
 
@@ -76,7 +81,7 @@ on every request, so demotion/deletion takes effect immediately.
 
 ```bash
 BASE=http://127.0.0.1:8080
-TOKEN=$(curl -s $BASE/auth/login -d '{"username":"admin","password":"secret"}' \
+TOKEN=$(curl -s $BASE/auth/login -d '{"username":"admin","password":"dev-strong-pass"}' \
   -H 'content-type: application/json' | jq -r .token)
 
 curl -s $BASE/me -H "Authorization: Bearer $TOKEN" | jq .
