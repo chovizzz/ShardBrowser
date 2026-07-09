@@ -2,6 +2,7 @@ use axum::extract::{Path, State};
 use axum::Json;
 use serde_json::{json, Value};
 
+use crate::extract::AppJson;
 use crate::audit;
 use crate::auth::AuthUser;
 use crate::error::AppError;
@@ -66,7 +67,7 @@ async fn creates_cycle(app: &AppState, folder_id: &str, candidate: &str) -> Resu
 pub async fn create(
     State(app): State<AppState>,
     user: AuthUser,
-    Json(req): Json<CreateFolderReq>,
+    AppJson(req): AppJson<CreateFolderReq>,
 ) -> Result<Json<Folder>, AppError> {
     user.require_admin()?;
     if req.name.trim().is_empty() {
@@ -103,7 +104,7 @@ pub async fn update(
     State(app): State<AppState>,
     user: AuthUser,
     Path(id): Path<String>,
-    Json(req): Json<UpdateFolderReq>,
+    AppJson(req): AppJson<UpdateFolderReq>,
 ) -> Result<Json<Value>, AppError> {
     user.require_admin()?;
     // Validate the parent move BEFORE mutating anything, so a rejected parent

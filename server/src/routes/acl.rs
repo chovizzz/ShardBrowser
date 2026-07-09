@@ -2,6 +2,7 @@ use axum::extract::State;
 use axum::Json;
 use serde_json::{json, Value};
 
+use crate::extract::AppJson;
 use crate::auth::AuthUser;
 use crate::error::AppError;
 use crate::models::{GrantReq, RevokeReq};
@@ -14,7 +15,7 @@ fn valid_kind(k: &str) -> bool {
 pub async fn grant(
     State(app): State<AppState>,
     user: AuthUser,
-    Json(req): Json<GrantReq>,
+    AppJson(req): AppJson<GrantReq>,
 ) -> Result<Json<Value>, AppError> {
     user.require_admin()?;
     if !valid_kind(&req.object_kind) {
@@ -68,7 +69,7 @@ pub async fn grant(
 pub async fn revoke(
     State(app): State<AppState>,
     user: AuthUser,
-    Json(req): Json<RevokeReq>,
+    AppJson(req): AppJson<RevokeReq>,
 ) -> Result<Json<Value>, AppError> {
     user.require_admin()?;
     let res = sqlx::query("DELETE FROM acl WHERE user_id = ? AND object_id = ? AND object_kind = ?")

@@ -4,6 +4,7 @@ mod blob;
 mod config;
 mod db;
 mod error;
+mod extract;
 mod models;
 mod ratelimit;
 mod routes;

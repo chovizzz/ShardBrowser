@@ -793,3 +793,27 @@ async fn env_update_clears_folder_and_rejects_bad_folder() {
     let updated: Value = r.json().await.unwrap();
     assert!(updated["folder_id"].is_null(), "folder_id cleared to null");
 }
+
+/// A malformed JSON body is rejected as the uniform { "error": ... } shape,
+/// not axum's default plain-text rejection.
+#[tokio::test]
+async fn malformed_json_body_returns_json_error() {
+    let port = 38089u16;
+    let data = std::env::temp_dir().join(format!("shardx-e2e-badjson-{}", std::process::id()));
+    let _guard = spawn_server(&data, port);
+    let c = client();
+    wait_health(&c, port).await;
+    let admin = token(&c, port, "admin", "secret").await;
+
+    let r = c
+        .post(format!("{}/users", base(port)))
+        .bearer_auth(&admin)
+        .header("content-type", "application/json")
+        .body("{ this is not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 400, "malformed body → 400");
+    let body: Value = r.json().await.expect("response is JSON");
+    assert!(body.get("error").and_then(|e| e.as_str()).is_some(), "has an error field: {body}");
+}

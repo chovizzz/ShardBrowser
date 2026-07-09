@@ -2,6 +2,7 @@ use axum::extract::{Path, State};
 use axum::Json;
 use serde_json::{json, Value};
 
+use crate::extract::AppJson;
 use crate::auth::{self, AuthUser};
 use crate::audit;
 use crate::error::AppError;
@@ -23,7 +24,7 @@ pub async fn list(
 pub async fn create(
     State(app): State<AppState>,
     user: AuthUser,
-    Json(req): Json<CreateUserReq>,
+    AppJson(req): AppJson<CreateUserReq>,
 ) -> Result<Json<Value>, AppError> {
     user.require_admin()?;
     let role = match req.role.as_deref() {
@@ -84,7 +85,7 @@ pub async fn reset_password(
     State(app): State<AppState>,
     user: AuthUser,
     Path(id): Path<String>,
-    Json(req): Json<ResetPasswordReq>,
+    AppJson(req): AppJson<ResetPasswordReq>,
 ) -> Result<Json<Value>, AppError> {
     user.require_admin()?;
     if req.password.is_empty() {
@@ -109,7 +110,7 @@ pub async fn set_role(
     State(app): State<AppState>,
     user: AuthUser,
     Path(id): Path<String>,
-    Json(req): Json<SetRoleReq>,
+    AppJson(req): AppJson<SetRoleReq>,
 ) -> Result<Json<Value>, AppError> {
     user.require_admin()?;
     if req.role != "admin" && req.role != "member" {

@@ -23,16 +23,16 @@ use crate::routes::envs::{load_accessible, Perm};
 use crate::state::AppState;
 use crate::{blob, util};
 
-fn client_id(body: &Option<Json<ClientReq>>) -> String {
+fn client_id(body: &Option<ClientReq>) -> String {
     body.as_ref()
-        .and_then(|b| b.0.client_id.clone())
+        .and_then(|b| b.client_id.clone())
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "default".to_string())
 }
 
-fn lock_token(body: &Option<Json<ClientReq>>) -> String {
+fn lock_token(body: &Option<ClientReq>) -> String {
     body.as_ref()
-        .and_then(|b| b.0.lock_token.clone())
+        .and_then(|b| b.lock_token.clone())
         .unwrap_or_default()
 }
 
@@ -149,7 +149,7 @@ pub async fn checkout(
     State(app): State<AppState>,
     user: AuthUser,
     Path(id): Path<String>,
-    body: Option<Json<ClientReq>>,
+    crate::extract::AppJsonOpt(body): crate::extract::AppJsonOpt<ClientReq>,
 ) -> Result<Json<Value>, AppError> {
     let client = client_id(&body);
     let presented = lock_token(&body);
@@ -252,7 +252,7 @@ pub async fn lease(
     State(app): State<AppState>,
     user: AuthUser,
     Path(id): Path<String>,
-    body: Option<Json<ClientReq>>,
+    crate::extract::AppJsonOpt(body): crate::extract::AppJsonOpt<ClientReq>,
 ) -> Result<Json<Value>, AppError> {
     let client = client_id(&body);
     let token = lock_token(&body);
@@ -424,7 +424,7 @@ pub async fn release(
     State(app): State<AppState>,
     user: AuthUser,
     Path(id): Path<String>,
-    body: Option<Json<ClientReq>>,
+    crate::extract::AppJsonOpt(body): crate::extract::AppJsonOpt<ClientReq>,
 ) -> Result<Json<Value>, AppError> {
     let client = client_id(&body);
     let token = lock_token(&body);

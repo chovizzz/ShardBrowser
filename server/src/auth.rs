@@ -12,6 +12,7 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::extract::AppJson;
 use crate::db;
 use crate::error::AppError;
 use crate::models::LoginReq;
@@ -155,7 +156,7 @@ pub async fn login(
     State(app): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(req): Json<LoginReq>,
+    AppJson(req): AppJson<LoginReq>,
 ) -> Result<Json<Value>, AppError> {
     let ip = client_ip(&app, &headers, peer);
     // Raw username: accounts are case-sensitive, so a case variant targets a
@@ -222,7 +223,7 @@ pub async fn me(user: AuthUser) -> Json<Value> {
 pub async fn change_password(
     State(app): State<AppState>,
     user: AuthUser,
-    Json(req): Json<crate::models::ChangePasswordReq>,
+    AppJson(req): AppJson<crate::models::ChangePasswordReq>,
 ) -> Result<Json<Value>, AppError> {
     if req.new_password.is_empty() {
         return Err(AppError::BadRequest("new password required".into()));

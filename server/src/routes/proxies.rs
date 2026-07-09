@@ -2,6 +2,7 @@ use axum::extract::{Path, State};
 use axum::Json;
 use serde_json::{json, Value};
 
+use crate::extract::AppJson;
 use crate::audit;
 use crate::auth::AuthUser;
 use crate::error::AppError;
@@ -32,7 +33,7 @@ pub async fn list(
 pub async fn create(
     State(app): State<AppState>,
     user: AuthUser,
-    Json(req): Json<CreateProxyReq>,
+    AppJson(req): AppJson<CreateProxyReq>,
 ) -> Result<Json<Proxy>, AppError> {
     user.require_admin()?;
     let id = util::new_id();

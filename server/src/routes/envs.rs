@@ -2,6 +2,7 @@ use axum::extract::{Path, State};
 use axum::Json;
 use serde_json::{json, Value};
 
+use crate::extract::AppJson;
 use crate::audit;
 use crate::auth::AuthUser;
 use crate::error::AppError;
@@ -135,7 +136,7 @@ pub(crate) async fn load_accessible(
 pub async fn create(
     State(app): State<AppState>,
     user: AuthUser,
-    Json(req): Json<CreateEnvReq>,
+    AppJson(req): AppJson<CreateEnvReq>,
 ) -> Result<Json<Value>, AppError> {
     user.require_admin()?;
     if req.name.trim().is_empty() {
@@ -175,7 +176,7 @@ pub async fn update(
     State(app): State<AppState>,
     user: AuthUser,
     Path(id): Path<String>,
-    Json(req): Json<UpdateEnvReq>,
+    AppJson(req): AppJson<UpdateEnvReq>,
 ) -> Result<Json<Value>, AppError> {
     // Members holding an 'edit' grant may change content fields; moving the
     // env (folder = who can see it) or rebinding infrastructure (proxy =
