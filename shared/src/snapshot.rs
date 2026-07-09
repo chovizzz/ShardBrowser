@@ -92,6 +92,9 @@ pub fn pack(udd: &Path) -> Result<Vec<u8>> {
     let gz = GzEncoder::new(Vec::new(), Compression::default());
     let mut tar = tar::Builder::new(gz);
     tar.follow_symlinks(false);
+    // Never emit GNU-sparse entries: unpack refuses them (a raw-iteration reader
+    // can't safely expand a sparse map), so producing one would strand a file.
+    tar.sparse(false);
 
     // Embed the portable plaintext state first.
     let mut header = tar::Header::new_gnu();
@@ -198,18 +201,143 @@ fn remove_path(p: &Path) {
     }
 }
 
+// Decompression-bomb guards for member-uploaded snapshots: a malicious snapshot
+// must not exhaust a puller's disk/CPU. Bounds are generous vs a real profile
+// (a few MB–low GB) but tight vs a bomb (a 512 MB upload of zeros expands to
+// hundreds of GB otherwise).
+const MAX_TOTAL_EXPANDED: u64 = 4 * 1024 * 1024 * 1024; // total across all files
+const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024; // single file
+const MAX_ENTRIES: usize = 100_000;
+const MAX_PATH_DEPTH: usize = 64;
+const MAX_PATH_BYTES: usize = 4096; // single archive path length
+const MAX_PORTABLE_BYTES: u64 = 512 * 1024 * 1024; // portable-state JSON
+const MAX_EXT_BYTES: u64 = 64 * 1024; // GNU-longname / PAX extension header body
+const MAX_EXPANSION_RATIO: u64 = 100; // expanded / compressed
+const RATIO_FLOOR_BYTES: u64 = 64 * 1024 * 1024; // ratio ignored below this
+
+/// Cap on total expanded bytes for a snapshot of `compressed_len` bytes: at most
+/// `MAX_EXPANSION_RATIO`× the input, but always allowing `RATIO_FLOOR_BYTES` (so
+/// a small, legitimately-compressible profile isn't rejected) and never more
+/// than the absolute `MAX_TOTAL_EXPANDED`.
+fn expand_cap(compressed_len: usize) -> u64 {
+    (compressed_len as u64)
+        .saturating_mul(MAX_EXPANSION_RATIO)
+        .max(RATIO_FLOOR_BYTES)
+        .min(MAX_TOTAL_EXPANDED)
+}
+
+/// Reader that errors once more than `remaining` bytes have been pulled from the
+/// inner stream. Wrapping the gzip decoder with this caps the TOTAL decompressed
+/// bytes tar can ever read — file data, tar headers/padding, AND the GNU-longname
+/// / PAX extension bodies that tar-rs buffers *before* yielding a business entry.
+/// So it bounds a decompression bomb regardless of tar-format tricks (a lying or
+/// PAX-overridden per-entry size can't get past it). Fails closed (error, not
+/// silent EOF) so a truncated read never looks like a clean end-of-archive.
+struct LimitReader<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R: std::io::Read> std::io::Read for LimitReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "snapshot exceeds the decompressed size limit (possible bomb)",
+            ));
+        }
+        let cap = buf.len().min(self.remaining as usize);
+        let n = self.inner.read(&mut buf[..cap])?;
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
 /// Materialize a snapshot into `staging`, preserving `udd`'s machine-bound
 /// `Local State` key so cookies re-encrypt to the same key this machine
 /// already uses (matters on Windows, where the key lives in `Local State`;
 /// on macOS/Linux the key is fixed and this is a harmless no-op).
 fn build_staging(bytes: &[u8], udd: &Path, staging: &Path) -> Result<PortableState> {
-    let mut archive = tar::Archive::new(GzDecoder::new(bytes));
+    // Hard backstop: cap the total decompressed bytes tar may read (see
+    // LimitReader). Per-entry checks below fail earlier with clearer errors.
+    let cap = expand_cap(bytes.len());
+    let reader = LimitReader { inner: GzDecoder::new(bytes), remaining: cap };
+    let mut archive = tar::Archive::new(reader);
     let mut state = PortableState::default();
 
-    for entry in archive.entries()? {
+    let mut total: u64 = 0;
+    let mut count: usize = 0;
+    // A pending GNU-longname body names the *next* file entry (paths >100 bytes,
+    // e.g. long IndexedDB origins). We resolve it ourselves — see below.
+    let mut pending_long_name: Option<String> = None;
+
+    // Raw iteration: tar yields every physical entry WITHOUT buffering the GNU
+    // longname / PAX extension bodies (which non-raw iteration `read_all`s into a
+    // Vec before yielding a business entry — a memory bomb). We cap those bodies
+    // and resolve GNU longnames ourselves; PAX (`x`/`g`) we never emit, so cap +
+    // skip. Raw also means no PAX `size=` override (so `e.size()` is the true
+    // physical length) and GNU-sparse maps aren't expanded.
+    for entry in archive.entries()?.raw(true) {
         let mut e = entry?;
-        let rel = e.path()?.to_string_lossy().replace('\\', "/");
+
+        count += 1;
+        if count > MAX_ENTRIES {
+            bail!("snapshot has too many entries (>{MAX_ENTRIES}) — refusing");
+        }
+
+        let et = e.header().entry_type();
+        // We never emit GNU-sparse (pack sets sparse(false)); a raw reader can't
+        // safely expand its map, so refuse rather than silently drop the file.
+        if et == tar::EntryType::GNUSparse {
+            bail!("snapshot contains an unsupported GNU-sparse entry — refusing");
+        }
+        // GNU longname: the real path of the following entry. Cap it, then read
+        // it here (bounded) so a long path still resolves correctly.
+        if et == tar::EntryType::GNULongName {
+            if pending_long_name.is_some() {
+                bail!("snapshot has two longname headers for one entry — refusing");
+            }
+            if e.size() > MAX_EXT_BYTES {
+                bail!("snapshot has an oversized tar longname header — refusing");
+            }
+            let mut name = String::new();
+            e.read_to_string(&mut name)?;
+            pending_long_name = Some(name.trim_end_matches('\0').replace('\\', "/"));
+            continue;
+        }
+        // Other extension headers we never emit (GNU longlink, PAX x/g): cap the
+        // body and skip without buffering or resolving.
+        if matches!(
+            et,
+            tar::EntryType::GNULongLink | tar::EntryType::XHeader | tar::EntryType::XGlobalHeader
+        ) {
+            if e.size() > MAX_EXT_BYTES {
+                bail!("snapshot has an oversized tar extension header — refusing");
+            }
+            continue;
+        }
+
+        let size = e.size();
+        if size > MAX_FILE_BYTES {
+            bail!("snapshot entry exceeds the {MAX_FILE_BYTES}-byte file limit — refusing");
+        }
+        total = total.saturating_add(size);
+        if total > cap {
+            bail!("snapshot expands beyond {cap} bytes — refusing (possible decompression bomb)");
+        }
+
+        // Prefer a pending GNU longname over the (truncated) ustar header name.
+        let rel = match pending_long_name.take() {
+            Some(n) => n,
+            None => e.path()?.to_string_lossy().replace('\\', "/"),
+        };
+        if rel.len() > MAX_PATH_BYTES {
+            bail!("snapshot path exceeds {MAX_PATH_BYTES} bytes — refusing");
+        }
         if rel == PORTABLE_FILE {
+            if size > MAX_PORTABLE_BYTES {
+                bail!("snapshot portable state exceeds {MAX_PORTABLE_BYTES} bytes — refusing");
+            }
             let mut s = String::new();
             e.read_to_string(&mut s)?;
             state = serde_json::from_str(&s).unwrap_or_default();
@@ -218,10 +346,12 @@ fn build_staging(bytes: &[u8], udd: &Path, staging: &Path) -> Result<PortableSta
         if is_excluded(&rel) {
             continue; // defensive; should already be absent
         }
+        if rel.split('/').filter(|c| !c.is_empty()).count() > MAX_PATH_DEPTH {
+            bail!("snapshot path is nested deeper than {MAX_PATH_DEPTH} — refusing: {rel}");
+        }
         // Snapshots are member-uploadable bytes: only ever materialize plain
         // files and directories. A symlink/hardlink/device entry could plant a
         // link that escapes the udd on a later write — reject all of them.
-        let et = e.header().entry_type();
         if !(et.is_file() || et.is_dir()) {
             continue;
         }
@@ -230,6 +360,10 @@ fn build_staging(bytes: &[u8], udd: &Path, staging: &Path) -> Result<PortableSta
             std::fs::create_dir_all(parent)?;
         }
         e.unpack(&out)?;
+    }
+    // A longname with no following entry means a truncated/crafted archive.
+    if pending_long_name.is_some() {
+        bail!("snapshot ends with a dangling longname header — refusing");
     }
 
     // Carry over this machine's existing os_crypt key (if any) so we don't
@@ -337,6 +471,91 @@ mod tests {
     fn rejects_path_traversal() {
         assert!(safe_join(Path::new("/tmp/x"), "../../etc/passwd").is_err());
         assert!(safe_join(Path::new("/tmp/x"), "Default/ok").is_ok());
+    }
+
+    #[test]
+    fn limit_reader_caps_total_bytes() {
+        use std::io::Read;
+        // The backstop that bounds decompression regardless of tar-format tricks:
+        // it errors (not silently EOFs) once more than `remaining` bytes are read.
+        let data = vec![7u8; 100];
+        let mut lr = LimitReader { inner: &data[..], remaining: 50 };
+        let mut out = Vec::new();
+        assert!(lr.read_to_end(&mut out).is_err(), "reading past the cap must error");
+        assert!(out.len() <= 50, "never yields more than the cap");
+    }
+
+    #[test]
+    fn expand_cap_bounds() {
+        // Small input → floored so legit compressible profiles pass.
+        assert_eq!(expand_cap(1024), 64 * 1024 * 1024);
+        // Mid input → ratio-bounded (compressed × 100).
+        assert_eq!(expand_cap(10 * 1024 * 1024), 10 * 1024 * 1024 * 100);
+        // Large input → clamped to the absolute cap.
+        assert_eq!(expand_cap(100 * 1024 * 1024), 4 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn unpack_rejects_decompression_bomb() {
+        use std::io::Read;
+        // One 70 MiB file of zeros compresses to a few KB — well past the 64 MiB
+        // floor, so it must be refused before anything is written to disk.
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut tar = tar::Builder::new(gz);
+        let n = 70 * 1024 * 1024u64;
+        let mut h = tar::Header::new_gnu();
+        h.set_size(n);
+        h.set_mode(0o644);
+        h.set_cksum();
+        tar.append_data(&mut h, "Default/big", std::io::repeat(0u8).take(n)).unwrap();
+        let bytes = tar.into_inner().unwrap().finish().unwrap();
+
+        let base = std::env::temp_dir().join(format!("shardx-snap-bomb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dst = base.join("dst");
+        assert!(unpack(&bytes, &dst).is_err(), "decompression bomb must be rejected");
+        assert!(!dst.exists(), "nothing materialized for a rejected bomb");
+    }
+
+    #[test]
+    fn unpack_rejects_oversized_extension_header() {
+        use std::io::Read;
+        // A GNU longname header whose body is far larger than a real path — the
+        // memory-bomb shape non-raw iteration would buffer. Must be refused by
+        // its declared size, before the body is read.
+        let big = 200 * 1024u64; // > MAX_EXT_BYTES
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut tar = tar::Builder::new(gz);
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::GNULongName);
+        h.set_size(big);
+        h.set_mode(0o644);
+        h.set_cksum();
+        tar.append_data(&mut h, "././@LongLink", std::io::repeat(b'a').take(big)).unwrap();
+        let bytes = tar.into_inner().unwrap().finish().unwrap();
+
+        let base = std::env::temp_dir().join(format!("shardx-snap-ext-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dst = base.join("dst");
+        assert!(unpack(&bytes, &dst).is_err(), "oversized extension header must be rejected");
+    }
+
+    #[test]
+    fn unpack_rejects_deeply_nested_path() {
+        let deep = vec!["a"; MAX_PATH_DEPTH + 5].join("/") + "/f";
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut tar = tar::Builder::new(gz);
+        let mut h = tar::Header::new_gnu();
+        h.set_size(1);
+        h.set_mode(0o644);
+        h.set_cksum();
+        tar.append_data(&mut h, &deep, &b"x"[..]).unwrap();
+        let bytes = tar.into_inner().unwrap().finish().unwrap();
+
+        let base = std::env::temp_dir().join(format!("shardx-snap-deep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dst = base.join("dst");
+        assert!(unpack(&bytes, &dst).is_err(), "deeply nested path must be rejected");
     }
 
     #[test]
