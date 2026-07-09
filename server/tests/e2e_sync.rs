@@ -141,12 +141,12 @@ async fn checkout_checkin_snapshot_roundtrip() {
 
     // checkin with a WRONG token is rejected (stale-session protection)
     let bad = reqwest::multipart::Form::new()
-        .text("client_id", "tester")
-        .text("lock_token", "not-the-token")
         .part("snapshot", reqwest::multipart::Part::bytes(snapshot.clone()).file_name("s.tgz"));
     let resp = c
         .post(format!("{}/envs/{env_id}/checkin", base(port)))
         .bearer_auth(&admin)
+        .header("x-client-id", "tester")
+        .header("x-lock-token", "not-the-token")
         .multipart(bad)
         .send()
         .await
@@ -155,12 +155,12 @@ async fn checkout_checkin_snapshot_roundtrip() {
 
     // checkin with the RIGHT token, exactly as sync.rs::upload builds it
     let form = reqwest::multipart::Form::new()
-        .text("client_id", "tester")
-        .text("lock_token", lock_token)
         .part("snapshot", reqwest::multipart::Part::bytes(snapshot).file_name("snapshot.tgz"));
     let resp = c
         .post(format!("{}/envs/{env_id}/checkin", base(port)))
         .bearer_auth(&admin)
+        .header("x-client-id", "tester")
+        .header("x-lock-token", lock_token)
         .multipart(form)
         .send()
         .await
@@ -443,12 +443,12 @@ async fn stale_lock_takeover_and_password_invalidation() {
 
     // alice's late checkin with her old token must NOT clobber bob's lock
     let form = reqwest::multipart::Form::new()
-        .text("client_id", "a")
-        .text("lock_token", alice_token)
         .part("snapshot", reqwest::multipart::Part::bytes(vec![1u8, 2, 3]).file_name("s.tgz"));
     let resp = c
         .post(format!("{}/envs/{env_id}/checkin", base(port)))
         .bearer_auth(&alice)
+        .header("x-client-id", "a")
+        .header("x-lock-token", alice_token)
         .multipart(form)
         .send()
         .await
@@ -542,12 +542,12 @@ async fn snapshot_download_requires_lock_token() {
         .unwrap();
     let tok0 = v0["lock_token"].as_str().unwrap().to_string();
     let form = reqwest::multipart::Form::new()
-        .text("client_id", "a")
-        .text("lock_token", tok0)
         .part("snapshot", reqwest::multipart::Part::bytes(snap).file_name("s.tgz"));
     let r = c
         .post(format!("{}/envs/{env_id}/checkin", base(port)))
         .bearer_auth(&alice)
+        .header("x-client-id", "a")
+        .header("x-lock-token", tok0)
         .multipart(form)
         .send()
         .await

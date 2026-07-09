@@ -398,21 +398,21 @@ async fn download(profile_id: &str, url_path: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Multipart checkin upload; carries the lock_token so the server can confirm
-/// this session still owns the lock.
+/// Multipart checkin upload. The session identity (client_id + lock_token) goes
+/// in headers, not body parts, so the server can authorize before reading the
+/// snapshot; the multipart body carries only the snapshot file itself.
 async fn upload(profile_id: &str, env_id: &str, bytes: Vec<u8>) -> Result<Value> {
     let (server, token, client_id) = config()?;
     let lock_token = stored_lock_token(profile_id).unwrap_or_default();
-    let form = reqwest::multipart::Form::new()
-        .text("client_id", client_id)
-        .text("lock_token", lock_token)
-        .part(
-            "snapshot",
-            reqwest::multipart::Part::bytes(bytes).file_name("snapshot.tgz"),
-        );
+    let form = reqwest::multipart::Form::new().part(
+        "snapshot",
+        reqwest::multipart::Part::bytes(bytes).file_name("snapshot.tgz"),
+    );
     let resp = http()?
         .post(format!("{server}/envs/{env_id}/checkin"))
         .bearer_auth(&token)
+        .header("x-client-id", client_id)
+        .header("x-lock-token", lock_token)
         .multipart(form)
         .send()
         .await

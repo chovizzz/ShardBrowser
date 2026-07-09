@@ -13,6 +13,7 @@ use axum::http::header;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::audit;
 use crate::auth::AuthUser;
@@ -52,6 +53,83 @@ async fn load_lock(app: &AppState, env_id: &str) -> Result<Option<Lock>, AppErro
             .fetch_optional(&app.db)
             .await?,
     )
+}
+
+/// Non-atomic check that this exact session (user + client + non-empty token)
+/// currently owns the lock. Used to reject a request before reading an upload
+/// body; the operation's own conditional SQL remains the atomic authority.
+async fn session_holds_lock(
+    app: &AppState,
+    env_id: &str,
+    user_id: &str,
+    client_id: &str,
+    token: &str,
+) -> Result<bool, AppError> {
+    if token.is_empty() {
+        return Ok(false);
+    }
+    let hit: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM locks WHERE env_id = ? AND owner_user_id = ? \
+         AND owner_client_id = ? AND lock_token = ?",
+    )
+    .bind(env_id)
+    .bind(user_id)
+    .bind(client_id)
+    .bind(token)
+    .fetch_optional(&app.db)
+    .await?;
+    Ok(hit.is_some())
+}
+
+/// Stream the multipart `snapshot` field to `temp`, hashing and enforcing the
+/// size cap incrementally so the whole upload is never buffered in memory.
+/// Returns (size bytes, sha256 hex). Non-`snapshot` fields are ignored — the
+/// session identity travels in headers now.
+async fn stream_snapshot(
+    multipart: &mut Multipart,
+    temp: &std::path::Path,
+    max: usize,
+) -> Result<(i64, String), AppError> {
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::File::create(temp)
+        .await
+        .map_err(|e| AppError::Internal(format!("open temp: {e}")))?;
+    let mut hasher = Sha256::new();
+    let mut size: usize = 0;
+    let mut got = false;
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("multipart: {e}")))?
+    {
+        // The multipart body now carries exactly the `snapshot` part (identity
+        // moved to headers); ignore anything else rather than guessing.
+        if field.name() != Some("snapshot") {
+            continue;
+        }
+        while let Some(chunk) = field
+            .chunk()
+            .await
+            .map_err(|e| AppError::BadRequest(format!("read snapshot: {e}")))?
+        {
+            size += chunk.len();
+            if size > max {
+                return Err(AppError::BadRequest("snapshot exceeds size limit".into()));
+            }
+            hasher.update(&chunk);
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| AppError::Internal(format!("write snapshot: {e}")))?;
+        }
+        got = true;
+    }
+    file.flush()
+        .await
+        .map_err(|e| AppError::Internal(format!("flush snapshot: {e}")))?;
+    if !got {
+        return Err(AppError::BadRequest("missing `snapshot` field".into()));
+    }
+    Ok((size as i64, format!("{:x}", hasher.finalize())))
 }
 
 fn snapshot_url(env_id: &str, version: i64) -> Option<String> {
@@ -199,57 +277,51 @@ pub async fn lease(
     })))
 }
 
-/// Upload a new snapshot (multipart: optional `client_id` + `lock_token`
-/// text parts, then the `snapshot` file) and release the lock. Requires the
-/// checkout session's lock_token — there is no admin bypass; recovery is
-/// force-unlock + a fresh checkout.
+/// Upload a new snapshot and release the lock. The session identity
+/// (`x-client-id` + `x-lock-token` headers) is checked BEFORE the body is read,
+/// and the `snapshot` multipart part is streamed to disk — an authenticated
+/// non-holder can't make us buffer a large upload. Requires the checkout
+/// session's lock_token; there is no admin bypass (recovery is force-unlock +
+/// a fresh checkout).
 pub async fn checkin(
     State(app): State<AppState>,
     user: AuthUser,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Json<Value>, AppError> {
-    let mut client = "default".to_string();
-    let mut token = String::new();
-    let mut bytes: Option<Vec<u8>> = None;
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| AppError::BadRequest(format!("multipart: {e}")))?
-    {
-        match field.name() {
-            Some("client_id") => {
-                if let Ok(v) = field.text().await {
-                    if !v.trim().is_empty() {
-                        client = v;
-                    }
-                }
-            }
-            Some("lock_token") => {
-                if let Ok(v) = field.text().await {
-                    token = v;
-                }
-            }
-            Some("snapshot") | None => {
-                let data = field
-                    .bytes()
-                    .await
-                    .map_err(|e| AppError::BadRequest(format!("read snapshot: {e}")))?;
-                if data.len() > app.cfg.max_snapshot_bytes {
-                    return Err(AppError::BadRequest("snapshot exceeds size limit".into()));
-                }
-                bytes = Some(data.to_vec());
-            }
-            _ => {}
-        }
-    }
-    let bytes = bytes.ok_or_else(|| AppError::BadRequest("missing `snapshot` field".into()))?;
+    // Identity comes from headers, not multipart body parts, so we can authorize
+    // BEFORE touching the (up to max_snapshot_bytes) upload — an authenticated
+    // non-holder must never make us buffer or stream a large snapshot.
+    let client = {
+        let c = header_str(&headers, "x-client-id");
+        if c.trim().is_empty() { "default".to_string() } else { c }
+    };
+    let token = header_str(&headers, "x-lock-token");
 
     let _ = load_accessible(&app, &user, &id, Perm::Use).await?;
 
-    // Stage the bytes under a unique temp name first; the final versioned
-    // path exists only after the transaction below has settled the version.
-    let (temp_path, size, sha) = blob::store_temp(&app.cfg, &id, &bytes).await?;
+    // Fast-fail lock pre-check (the atomic conditional DELETE below is still the
+    // authority). An empty token can never match.
+    if token.is_empty() || !session_holds_lock(&app, &id, &user.id, &client, &token).await? {
+        return Err(AppError::Conflict(
+            "you no longer hold this lock (expired, taken over, or bad token)".into(),
+        ));
+    }
+
+    // Stream the snapshot straight to a temp file — hashing and enforcing the
+    // size cap incrementally, never buffering the whole thing in memory. The
+    // final versioned path exists only after the transaction settles the version.
+    let temp = blob::new_temp(&app.cfg, &id).await?;
+    let temp_path = temp.to_string_lossy().into_owned();
+    let (size, sha) = match stream_snapshot(&mut multipart, &temp, app.cfg.max_snapshot_bytes).await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            blob::remove(&temp_path).await;
+            return Err(e);
+        }
+    };
 
     let result: Result<(i64, String), AppError> = async {
         let mut tx = app.db.begin().await?;
@@ -423,24 +495,7 @@ pub async fn download(
         // live session, or after the lock has moved on.
         let client_id = header_str(&headers, "x-client-id");
         let lock_token = header_str(&headers, "x-lock-token");
-        // Empty token never grants access — it would otherwise match a legacy
-        // migrated lock row whose token defaulted to ''.
-        if lock_token.is_empty() {
-            return Err(AppError::Conflict(
-                "snapshot download requires the current checkout's client_id + lock_token".into(),
-            ));
-        }
-        let holds: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM locks WHERE env_id = ? AND owner_user_id = ? \
-             AND owner_client_id = ? AND lock_token = ?",
-        )
-        .bind(&id)
-        .bind(&user.id)
-        .bind(&client_id)
-        .bind(&lock_token)
-        .fetch_optional(&app.db)
-        .await?;
-        if holds.is_none() {
+        if !session_holds_lock(&app, &id, &user.id, &client_id, &lock_token).await? {
             return Err(AppError::Conflict(
                 "snapshot download requires the current checkout's client_id + lock_token".into(),
             ));

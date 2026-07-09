@@ -201,7 +201,9 @@ pub struct RevokeReq {
 /// Identifies the holding session so two sessions of the same user don't
 /// silently share a lock. Optional; defaults to "default" server-side.
 /// `lock_token` is the secret returned by checkout — required for
-/// lease/release (and checkin, where it travels as a multipart field).
+/// checkout-reclaim/lease/release. (checkin/download take these two as
+/// `x-client-id` / `x-lock-token` headers instead, so identity is checked
+/// before the request body is read.)
 #[derive(Deserialize, Default)]
 pub struct ClientReq {
     #[serde(default)]

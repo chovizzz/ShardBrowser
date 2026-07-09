@@ -6,33 +6,21 @@
 
 use std::path::PathBuf;
 
-use sha2::{Digest, Sha256};
-
 use crate::config::Config;
 
 fn env_dir(cfg: &Config, env_id: &str) -> PathBuf {
     PathBuf::from(&cfg.blob_dir).join(env_id)
 }
 
-/// Write an incoming snapshot to a unique temp path first; it is promoted to
-/// its final `<version>.blob` name only after the DB transaction has settled
-/// the version, so two concurrent checkins can never overwrite each other's
-/// bytes. Returns (temp path, size bytes, sha256 hex).
-pub async fn store_temp(
-    cfg: &Config,
-    env_id: &str,
-    bytes: &[u8],
-) -> anyhow::Result<(String, i64, String)> {
+/// Create the env's blob dir and return a fresh unique temp path to stream an
+/// incoming snapshot into. The caller streams bytes to it (hashing + enforcing
+/// the size cap as it goes), then [`promote`]s it once the version is settled —
+/// so two concurrent checkins never overwrite each other's bytes — or
+/// [`remove`]s it on failure.
+pub async fn new_temp(cfg: &Config, env_id: &str) -> anyhow::Result<PathBuf> {
     let dir = env_dir(cfg, env_id);
     tokio::fs::create_dir_all(&dir).await?;
-    let path = dir.join(format!("incoming-{}.tmp", uuid::Uuid::new_v4()));
-    tokio::fs::write(&path, bytes).await?;
-
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let sha = format!("{:x}", hasher.finalize());
-
-    Ok((path.to_string_lossy().into_owned(), bytes.len() as i64, sha))
+    Ok(dir.join(format!("incoming-{}.tmp", uuid::Uuid::new_v4())))
 }
 
 /// Move a temp blob to its final versioned path; returns the final path.
