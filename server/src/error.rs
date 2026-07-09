@@ -12,6 +12,8 @@ pub enum AppError {
     Conflict(String),
     BadRequest(String),
     Internal(String),
+    /// Rate-limited; the value is the Retry-After hint in seconds.
+    TooManyRequests(u64),
 }
 
 impl AppError {
@@ -23,6 +25,9 @@ impl AppError {
             AppError::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
             AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
             AppError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m.clone()),
+            AppError::TooManyRequests(_) => {
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts; try again later".into())
+            }
         }
     }
 }
@@ -33,7 +38,13 @@ impl IntoResponse for AppError {
         if code == StatusCode::INTERNAL_SERVER_ERROR {
             tracing::error!("internal error: {msg}");
         }
-        (code, Json(json!({ "error": msg }))).into_response()
+        let mut resp = (code, Json(json!({ "error": msg }))).into_response();
+        if let AppError::TooManyRequests(secs) = self {
+            if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                resp.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+            }
+        }
+        resp
     }
 }
 

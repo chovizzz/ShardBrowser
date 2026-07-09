@@ -2,8 +2,11 @@ use argon2::password_hash::{
     rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
 };
 use argon2::Argon2;
-use axum::extract::{FromRef, FromRequestParts, State};
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, FromRef, FromRequestParts, State};
 use axum::http::request::Parts;
+use axum::http::HeaderMap;
 use axum::{async_trait, Json};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
@@ -128,21 +131,75 @@ where
 
 // ---- handlers ----
 
+/// Resolve the client IP for throttling. Trusts `X-Forwarded-For` / `X-Real-IP`
+/// only when `SHARDX_TRUST_PROXY=1` (i.e. behind an edge proxy that OVERWRITES
+/// the inbound header) — otherwise a client could spoof it to dodge the per-IP
+/// limit. The header value must parse as an IP or it's ignored.
+fn client_ip(app: &AppState, headers: &HeaderMap, peer: SocketAddr) -> String {
+    if app.cfg.trust_proxy {
+        for header in ["x-forwarded-for", "x-real-ip"] {
+            if let Some(raw) = headers.get(header).and_then(|v| v.to_str().ok()) {
+                let first = raw.split(',').next().unwrap_or("").trim();
+                // Return the parsed IP's canonical form so the same address in
+                // different text spellings maps to one throttle key.
+                if let Ok(addr) = first.parse::<std::net::IpAddr>() {
+                    return addr.to_string();
+                }
+            }
+        }
+    }
+    peer.ip().to_string()
+}
+
 pub async fn login(
     State(app): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<LoginReq>,
 ) -> Result<Json<Value>, AppError> {
+    let ip = client_ip(&app, &headers, peer);
+    // Raw username: accounts are case-sensitive, so a case variant targets a
+    // different (usually nonexistent) account, not this one.
+    let user_key = req.username.clone();
+
+    // Throttle BEFORE any DB lookup or Argon2, so a locked-out source can't
+    // drive brute force. `locked_for` returns the longer of the IP/user waits.
+    if let Some(retry) = app.login_throttle.locked_for(&ip, &user_key) {
+        return Err(AppError::TooManyRequests(retry));
+    }
+
     let user = match db::find_user_by_name(&app.db, &req.username).await? {
         Some(u) => u,
         None => {
-            crate::audit::log(&app.db, None, "login_failed", None, &req.username).await;
+            app.login_throttle.record_failure(&ip, &user_key);
+            let detail = format!("{} from {ip}", req.username);
+            crate::audit::log(&app.db, None, "login_failed", None, &detail).await;
             return Err(AppError::Unauthorized);
         }
     };
-    if verify_password(&req.password, &user.pw_hash).is_err() {
-        crate::audit::log(&app.db, Some(&user.id), "login_failed", None, &user.username).await;
+
+    // Bound concurrent Argon2 so a parallel first wave (all passing `locked_for`
+    // before any is recorded) can't exhaust CPU, and run it on the blocking pool
+    // so it never ties up an async worker. The permit is held across the await.
+    let verified = {
+        let _slot = app
+            .login_throttle
+            .try_verify_slot()
+            .ok_or(AppError::TooManyRequests(1))?;
+        let password = req.password.clone();
+        let hash = user.pw_hash.clone();
+        tokio::task::spawn_blocking(move || verify_password(&password, &hash).is_ok())
+            .await
+            .map_err(|e| AppError::Internal(format!("verify task: {e}")))?
+    };
+    if !verified {
+        app.login_throttle.record_failure(&ip, &user_key);
+        let detail = format!("{} from {ip}", user.username);
+        crate::audit::log(&app.db, Some(&user.id), "login_failed", None, &detail).await;
         return Err(AppError::Unauthorized);
     }
+    // Success clears the failure history for this IP + account.
+    app.login_throttle.record_success(&ip, &user_key);
     let token = issue(
         &app.cfg.token_secret,
         &user.id,

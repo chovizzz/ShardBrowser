@@ -162,6 +162,7 @@ mod tests {
             lease_ttl_secs: 90,
             snapshot_keep: 5,
             max_snapshot_bytes: 1024,
+            trust_proxy: false,
         }
     }
 

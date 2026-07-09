@@ -18,6 +18,10 @@ pub struct Config {
     pub snapshot_keep: i64,
     /// Max accepted snapshot upload size, bytes.
     pub max_snapshot_bytes: usize,
+    /// Trust `X-Forwarded-For` / `X-Real-IP` for the client IP (login throttle).
+    /// Only enable behind a reverse proxy that sets it — otherwise a client
+    /// could spoof the header to dodge the per-IP limit.
+    pub trust_proxy: bool,
 }
 
 impl Config {
@@ -65,6 +69,7 @@ impl Config {
         };
         let snapshot_keep = parse_env("SHARDX_SNAPSHOT_KEEP", 5);
         let max_snapshot_bytes = parse_env::<usize>("SHARDX_MAX_SNAPSHOT_BYTES", 512 * 1024 * 1024);
+        let trust_proxy = env_or("SHARDX_TRUST_PROXY", "0") == "1";
 
         Arc::new(Config {
             bind,
@@ -78,6 +83,7 @@ impl Config {
             lease_ttl_secs,
             snapshot_keep,
             max_snapshot_bytes,
+            trust_proxy,
         })
     }
 
@@ -116,6 +122,7 @@ mod tests {
             lease_ttl_secs: 0,
             snapshot_keep: 0,
             max_snapshot_bytes: 0,
+            trust_proxy: false,
         }
     }
 

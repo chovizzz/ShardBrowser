@@ -633,3 +633,29 @@ async fn reacquiring_live_lock_requires_token() {
     // The old token no longer works.
     assert_eq!(checkout(Some(&tok)).await.unwrap().status().as_u16(), 409, "old token invalid after rotate");
 }
+
+/// Repeated failed logins from one source get throttled (429 with Retry-After)
+/// before any password verify — brute-force / Argon2 CPU-exhaustion guard.
+#[tokio::test]
+async fn login_throttles_after_repeated_failures() {
+    let port = 38085u16;
+    let data = std::env::temp_dir().join(format!("shardx-e2e-throttle-{}", std::process::id()));
+    let _guard = spawn_server(&data, port);
+    let c = client();
+    wait_health(&c, port).await;
+
+    let attempt = |password: &str| {
+        c.post(format!("{}/auth/login", base(port)))
+            .json(&json!({ "username": "admin", "password": password }))
+            .send()
+    };
+
+    // Five wrong-password attempts are plain 401s.
+    for _ in 0..5 {
+        assert_eq!(attempt("wrong").await.unwrap().status().as_u16(), 401);
+    }
+    // Now the source is locked: even the CORRECT password is refused with 429.
+    let r = attempt("secret").await.unwrap();
+    assert_eq!(r.status().as_u16(), 429, "locked out after repeated failures");
+    assert!(r.headers().get("retry-after").is_some(), "429 carries Retry-After");
+}

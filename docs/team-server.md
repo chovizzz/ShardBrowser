@@ -193,6 +193,12 @@ checkin 不会互相覆盖。撤销 ACL 会立即中断续租/归还（这些操
 单 Docker 容器,挂载一个数据卷(`./data`)。配置走环境变量:监听地址、
 Token 签名密钥、存储路径、(可选)S3 端点。
 
+**登录限速**:`/auth/login` 有指数退避锁定——按客户端 IP(阈值 5)和用户名(阈值 15,更宽
+松以免合法用户被 lockout DoS)分别计数,达阈值前置返回 429 + `Retry-After`(在 DB 查询/Argon2
+之前);另有全局信号量封顶并发 Argon2 验证数,挡并发首波 CPU 耗尽。客户端 IP 默认取真实 peer
+socket(不可伪造);`SHARDX_TRUST_PROXY=1` 时才信 `X-Forwarded-For`/`X-Real-IP`(需 IP 格式合法)——
+**仅当反代会覆盖入站该头且禁止直连时才可开**,否则客户端可伪造头绕过 per-IP 限速。状态进程内(重启即清)。
+
 **安全默认**:裸机默认 `SHARDX_BIND=127.0.0.1:8080`(仅本机可达);Docker 镜像设为
 `0.0.0.0:8080`(经端口映射/反代暴露)。一旦 bind 非 loopback,服务器对**弱口令 admin
 拒绝启动**:① 首次 bootstrap 时口令为空/过短(<8)/占位符(admin、secret、change-me…)即

@@ -5,6 +5,7 @@ mod config;
 mod db;
 mod error;
 mod models;
+mod ratelimit;
 mod routes;
 mod state;
 mod util;
@@ -40,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         db: pool,
         cfg: cfg.clone(),
+        login_throttle: std::sync::Arc::new(ratelimit::LoginThrottle::new()),
     };
     // No CORS layer on purpose: the only client is the desktop launcher
     // (reqwest, no Origin). Browser-origin access stays blocked by default.
@@ -48,7 +50,9 @@ async fn main() -> anyhow::Result<()> {
     let addr = SocketAddr::from_str(&cfg.bind)?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("ShardX Team Server listening on http://{addr}");
-    axum::serve(listener, app)
+    // `into_make_service_with_connect_info` so handlers can read the peer IP
+    // (the login throttle keys on it).
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
