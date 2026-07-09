@@ -135,6 +135,9 @@ pub fn spawn_lease_renewer(profile_id: String, env_id: String) {
         let res = lease(&profile_id, &env_id).await;
         if let Err(e) = &res {
             eprintln!("[launcher] initial lease renew failed for env {env_id}: {e}");
+            if lease_error_is_terminal(e) {
+                return; // lock lost / access revoked — nothing left to renew
+            }
         }
         let mut interval = interval_after(&res);
         loop {
@@ -149,6 +152,10 @@ pub fn spawn_lease_renewer(profile_id: String, env_id: String) {
             let res = lease(&profile_id, &env_id).await;
             if let Err(e) = &res {
                 eprintln!("[launcher] lease renew failed for env {env_id}: {e}");
+                if lease_error_is_terminal(e) {
+                    eprintln!("[launcher] lease for env {env_id} is gone; stopping renewer");
+                    break;
+                }
             }
             interval = interval_after(&res);
         }
@@ -169,14 +176,25 @@ impl LeaseGuard {
         let (pid, eid, flag) = (profile_id.to_string(), env_id.to_string(), stop.clone());
         tokio::spawn(async move {
             // Renew immediately, learning the server TTL so the cadence tracks
-            // it (renew at ~TTL/3); a failed renew backs off to a short retry.
-            let mut interval = interval_after(&lease(&pid, &eid).await);
+            // it (renew at ~TTL/3); a failed renew backs off to a short retry,
+            // but a terminal failure (lock lost / access revoked) stops it.
+            let res = lease(&pid, &eid).await;
+            if let Some(e) = res.as_ref().err().filter(|e| lease_error_is_terminal(e)) {
+                eprintln!("[launcher] lease guard for env {eid} stopped: {e}");
+                return;
+            }
+            let mut interval = interval_after(&res);
             while !flag.load(std::sync::atomic::Ordering::Relaxed) {
                 tokio::time::sleep(interval).await;
                 if flag.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                interval = interval_after(&lease(&pid, &eid).await);
+                let res = lease(&pid, &eid).await;
+                if let Some(e) = res.as_ref().err().filter(|e| lease_error_is_terminal(e)) {
+                    eprintln!("[launcher] lease guard for env {eid} stopped: {e}");
+                    break;
+                }
+                interval = interval_after(&res);
             }
         });
         Self { stop }
@@ -200,6 +218,33 @@ fn err_msg(v: &Value, fallback: &str) -> String {
         .and_then(|e| e.as_str())
         .unwrap_or(fallback)
         .to_string()
+}
+
+/// A non-2xx response from the team server, carrying the HTTP status so callers
+/// can distinguish terminal failures (lock lost, access revoked) from transient
+/// ones (network blip, 5xx) instead of parsing the error string.
+#[derive(Debug)]
+struct HttpError {
+    status: u16,
+    path: String,
+    msg: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}: {}", self.status, self.path, self.msg)
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+/// True if a failed lease/renew can never succeed on retry — the lock is gone,
+/// access was revoked, or the session is otherwise dead, so the renewer should
+/// stop rather than hammer the server. Network errors and 5xx are NOT terminal
+/// (they may recover), so this returns false for them.
+fn lease_error_is_terminal(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<HttpError>()
+        .is_some_and(|e| matches!(e.status, 400 | 401 | 403 | 404 | 409))
 }
 
 /// Authenticate against a team server; returns the bearer token.
@@ -243,7 +288,11 @@ async fn req(method: &str, path: &str, body: Option<Value>) -> Result<Value> {
     let text = resp.text().await.unwrap_or_default();
     let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
     if !status.is_success() {
-        return Err(anyhow!("{} {}: {}", status.as_u16(), path, err_msg(&v, &text)));
+        return Err(anyhow::Error::new(HttpError {
+            status: status.as_u16(),
+            path: path.to_string(),
+            msg: err_msg(&v, &text),
+        }));
     }
     Ok(v)
 }
@@ -520,6 +569,26 @@ mod tests {
         // Parses the field the server actually sends.
         assert_eq!(lease_ttl_secs(&json!({ "lease_ttl_secs": 90 })), Some(90));
         assert_eq!(lease_ttl_secs(&json!({ "env_id": "x" })), None);
+    }
+
+    #[test]
+    fn terminal_vs_transient_lease_errors() {
+        use super::{lease_error_is_terminal, HttpError};
+        let http = |status| {
+            anyhow::Error::new(HttpError { status, path: "/lease".into(), msg: "m".into() })
+        };
+        // Terminal: bad request / auth / access revoked / gone / lock lost.
+        for s in [400, 401, 403, 404, 409] {
+            assert!(lease_error_is_terminal(&http(s)), "{s} should be terminal");
+        }
+        // Transient: server hiccup or rate limit — keep retrying.
+        for s in [408, 429, 500, 502, 503] {
+            assert!(!lease_error_is_terminal(&http(s)), "{s} should be transient");
+        }
+        // A non-HTTP error (e.g. a network failure) is never terminal.
+        assert!(!lease_error_is_terminal(&anyhow::anyhow!("connection refused")));
+        // Still detected through a context wrapper.
+        assert!(lease_error_is_terminal(&http(409).context("renew lease")));
     }
 
     #[test]
