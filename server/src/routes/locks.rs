@@ -97,9 +97,13 @@ async fn stream_snapshot(
     let mut hasher = Sha256::new();
     let mut size: usize = 0;
     let mut got = false;
-    while let Some(mut field) = multipart
-        .next_field()
+    // Idle timeout per read: a stalled connection must not pin its upload slot
+    // until the socket dies (which would let a few stalls block all checkins).
+    const IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+    let stalled = || AppError::BadRequest("upload stalled".into());
+    while let Some(mut field) = tokio::time::timeout(IDLE, multipart.next_field())
         .await
+        .map_err(|_| stalled())?
         .map_err(|e| AppError::BadRequest(format!("multipart: {e}")))?
     {
         // The multipart body now carries exactly the `snapshot` part (identity
@@ -107,9 +111,9 @@ async fn stream_snapshot(
         if field.name() != Some("snapshot") {
             continue;
         }
-        while let Some(chunk) = field
-            .chunk()
+        while let Some(chunk) = tokio::time::timeout(IDLE, field.chunk())
             .await
+            .map_err(|_| stalled())?
             .map_err(|e| AppError::BadRequest(format!("read snapshot: {e}")))?
         {
             size += chunk.len();
@@ -309,6 +313,16 @@ pub async fn checkin(
         ));
     }
 
+    // Bound concurrent uploads so a burst of lock holders can't saturate disk /
+    // bandwidth. The slot covers only receiving+writing the body; it's released
+    // before the (cheap) commit (a rename + DB writes). The client retries on 429
+    // (its exit-checkin degrades to a recoverable pending push).
+    let upload = app
+        .upload_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::TooManyRequests(2))?;
+
     // Stream the snapshot straight to a temp file — hashing and enforcing the
     // size cap incrementally, never buffering the whole thing in memory. The
     // final versioned path exists only after the transaction settles the version.
@@ -322,6 +336,7 @@ pub async fn checkin(
             return Err(e);
         }
     };
+    drop(upload); // upload received; free the slot before the DB transaction
 
     let result: Result<(i64, String), AppError> = async {
         let mut tx = app.db.begin().await?;

@@ -10,4 +10,6 @@ pub struct AppState {
     pub db: sqlx::SqlitePool,
     pub cfg: Arc<Config>,
     pub login_throttle: Arc<LoginThrottle>,
+    /// Bounds concurrent checkin snapshot uploads (disk/bandwidth DoS guard).
+    pub upload_slots: Arc<tokio::sync::Semaphore>,
 }
