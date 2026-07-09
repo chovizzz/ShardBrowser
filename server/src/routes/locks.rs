@@ -535,7 +535,36 @@ pub async fn download(
     .fetch_optional(&app.db)
     .await?
     .ok_or(AppError::NotFound)?;
-    let bytes = blob::read(&snap.blob_path).await.map_err(AppError::from)?;
+    // Bound concurrent downloads (each streams a full snapshot: disk reads +
+    // bandwidth) the same way checkin bounds uploads. The permit is moved into
+    // the response body below, so it's held for the whole transfer and released
+    // when the stream is exhausted or the client disconnects.
+    let permit = app
+        .download_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::TooManyRequests(2))?;
+    // Stream straight from disk instead of buffering the whole blob in memory.
+    let file = blob::open(&snap.blob_path).await.map_err(AppError::from)?;
+    // Defense-in-depth: the advertised Content-Length is the size recorded at
+    // checkin. If the on-disk blob no longer matches (corruption, external
+    // tampering), a mismatched length would hang or truncate the client — fail
+    // loudly instead of streaming a body that contradicts its header.
+    let actual = file
+        .metadata()
+        .await
+        .map_err(|e| AppError::from(anyhow::Error::new(e)))?
+        .len();
+    if actual != snap.size as u64 {
+        return Err(AppError::Internal(format!(
+            "snapshot blob size mismatch for env {id} v{version}: recorded {}, on disk {actual}",
+            snap.size
+        )));
+    }
+    let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(GuardedReader {
+        inner: file,
+        _permit: permit,
+    }));
     // Distinguish an admin break-glass download (bypasses the lock check) from a
     // normal lock-holder pull, and record who currently holds the lock.
     let detail = if user.is_admin() {
@@ -553,14 +582,34 @@ pub async fn download(
     Ok((
         [
             (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_LENGTH, snap.size.to_string()),
             (
                 header::CONTENT_DISPOSITION,
                 format!("attachment; filename=\"{id}-v{version}.tar.zst\""),
             ),
             ("x-snapshot-sha256".parse().unwrap(), snap.sha256),
         ],
-        bytes,
+        body,
     ))
+}
+
+/// A blob reader that owns a download slot for the whole streamed response, so
+/// the concurrency bound covers the entire transfer — not just the handler call.
+/// Reads delegate to the inner file; the permit drops with the reader when the
+/// stream ends or the client disconnects.
+struct GuardedReader {
+    inner: tokio::fs::File,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl tokio::io::AsyncRead for GuardedReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
 }
 
 /// Drop snapshots older than the retention window, blobs and rows alike.

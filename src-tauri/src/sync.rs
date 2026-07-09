@@ -370,14 +370,42 @@ async fn download(profile_id: &str, url_path: &str) -> Result<Vec<u8>> {
     // snapshot download (plaintext cookies + payment secrets) to the exact
     // session holding the lock, not just any token of the same user.
     let lock_token = stored_lock_token(profile_id).unwrap_or_default();
-    let resp = http()?
-        .get(format!("{server}{url_path}"))
-        .bearer_auth(&token)
-        .header("x-client-id", client_id)
-        .header("x-lock-token", lock_token)
-        .send()
-        .await
-        .context("snapshot download failed")?;
+    // The server caps concurrent downloads (disk/bandwidth guard) and returns
+    // 429 + Retry-After when saturated. That's transient — back off and retry a
+    // few times before surfacing an error that would abort the launch, mirroring
+    // the checkin side's degrade-and-recover behavior.
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut attempt = 0u32;
+    let resp = loop {
+        let resp = http()?
+            .get(format!("{server}{url_path}"))
+            .bearer_auth(&token)
+            .header("x-client-id", client_id.clone())
+            .header("x-lock-token", lock_token.clone())
+            .send()
+            .await
+            .context("snapshot download failed")?;
+        if resp.status().as_u16() == 429 {
+            // Bounded by MAX_ATTEMPTS so a stuck 429 can't loop forever; cap the
+            // honored Retry-After so a hostile hint can't wedge the launch.
+            let wait = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(2)
+                .clamp(1, 10);
+            attempt += 1;
+            if attempt >= MAX_ATTEMPTS {
+                return Err(anyhow!(
+                    "download {url_path} rate-limited: still 429 after {MAX_ATTEMPTS} attempts"
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            continue;
+        }
+        break resp;
+    };
     if !resp.status().is_success() {
         return Err(anyhow!("download {url_path} failed: {}", resp.status()));
     }

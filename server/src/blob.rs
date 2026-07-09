@@ -92,8 +92,10 @@ pub async fn promote(cfg: &Config, env_id: &str, version: i64, temp_path: &str) 
     Ok(path.to_string_lossy().into_owned())
 }
 
-pub async fn read(path: &str) -> anyhow::Result<Vec<u8>> {
-    Ok(tokio::fs::read(path).await?)
+/// Open a blob for streaming (download path). The caller streams it to the
+/// response body rather than buffering the whole snapshot in memory.
+pub async fn open(path: &str) -> anyhow::Result<tokio::fs::File> {
+    Ok(tokio::fs::File::open(path).await?)
 }
 
 pub async fn remove(path: &str) {

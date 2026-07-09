@@ -12,4 +12,7 @@ pub struct AppState {
     pub login_throttle: Arc<LoginThrottle>,
     /// Bounds concurrent checkin snapshot uploads (disk/bandwidth DoS guard).
     pub upload_slots: Arc<tokio::sync::Semaphore>,
+    /// Bounds concurrent snapshot downloads — same disk/bandwidth guard on the
+    /// read path, held for the whole streamed transfer.
+    pub download_slots: Arc<tokio::sync::Semaphore>,
 }

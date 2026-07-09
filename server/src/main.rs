@@ -45,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
         cfg: cfg.clone(),
         login_throttle: std::sync::Arc::new(ratelimit::LoginThrottle::new()),
         upload_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+        download_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
     };
     // No CORS layer on purpose: the only client is the desktop launcher
     // (reqwest, no Origin). Browser-origin access stays blocked by default.
