@@ -25,16 +25,29 @@ pub async fn grant(
         Some("edit") => "edit",
         Some(o) => return Err(AppError::BadRequest(format!("invalid perm: {o}"))),
     };
-    sqlx::query(
-        "INSERT INTO acl (user_id, object_id, object_kind, perm) VALUES (?, ?, ?, ?) \
+    // Refuse a grant against a target (or user) that doesn't exist — otherwise
+    // the ACL row is a ghost that never applies and just lingers. Do it as one
+    // atomic statement (existence gated by `EXISTS` in the same INSERT) so a
+    // concurrent target delete can't slip a ghost row in between a check and the
+    // write. `object_kind` is validated above, so the table name is a fixed
+    // choice, not user input; ids/perm are bound.
+    let table = if req.object_kind == "env" { "environments" } else { "folders" };
+    let res = sqlx::query(&format!(
+        "INSERT INTO acl (user_id, object_id, object_kind, perm) \
+         SELECT ?1, ?2, ?3, ?4 \
+         WHERE EXISTS (SELECT 1 FROM {table} WHERE id = ?2) \
+           AND EXISTS (SELECT 1 FROM users WHERE id = ?1) \
          ON CONFLICT(user_id, object_id, object_kind) DO UPDATE SET perm = excluded.perm",
-    )
+    ))
     .bind(&req.user_id)
     .bind(&req.object_id)
     .bind(&req.object_kind)
     .bind(perm)
     .execute(&app.db)
     .await?;
+    if res.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
     crate::audit::log(
         &app.db,
         Some(&user.id),

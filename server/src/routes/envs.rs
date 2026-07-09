@@ -190,11 +190,31 @@ pub async fn update(
     if let Some(v) = req.name {
         env.name = v;
     }
-    if let Some(v) = req.folder_id {
-        env.folder_id = Some(v);
+    // absent = leave, Some(None) = clear, Some(Some(x)) = set (target checked so
+    // a bad id is a clean 404 rather than a foreign-key 400).
+    if let Some(folder) = req.folder_id {
+        if let Some(fid) = &folder {
+            let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM folders WHERE id = ?")
+                .bind(fid)
+                .fetch_optional(&app.db)
+                .await?;
+            if exists.is_none() {
+                return Err(AppError::NotFound);
+            }
+        }
+        env.folder_id = folder;
     }
-    if let Some(v) = req.proxy_id {
-        env.proxy_id = Some(v);
+    if let Some(proxy) = req.proxy_id {
+        if let Some(pid) = &proxy {
+            let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM proxies WHERE id = ?")
+                .bind(pid)
+                .fetch_optional(&app.db)
+                .await?;
+            if exists.is_none() {
+                return Err(AppError::NotFound);
+            }
+        }
+        env.proxy_id = proxy;
     }
     if let Some(v) = req.host_os {
         env.host_os = Some(v);

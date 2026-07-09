@@ -686,3 +686,110 @@ async fn bad_foreign_key_is_client_error_not_500() {
         "error message must not leak DB internals: {err}"
     );
 }
+
+/// ACL grants against a nonexistent target or user are refused (no ghost rows).
+#[tokio::test]
+async fn acl_grant_rejects_ghost_target_or_user() {
+    let port = 38087u16;
+    let data = std::env::temp_dir().join(format!("shardx-e2e-ghost-{}", std::process::id()));
+    let _guard = spawn_server(&data, port);
+    let c = client();
+    wait_health(&c, port).await;
+    let admin = token(&c, port, "admin", "secret").await;
+
+    c.post(format!("{}/users", base(port)))
+        .bearer_auth(&admin)
+        .json(&json!({ "username": "alice", "password": "pw" }))
+        .send()
+        .await
+        .unwrap();
+    let users: Value = c
+        .get(format!("{}/users", base(port)))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let alice_id = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["username"] == "alice")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let grant = |user_id: &str, object_id: &str| {
+        c.post(format!("{}/acl", base(port)))
+            .bearer_auth(&admin)
+            .json(&json!({ "user_id": user_id, "object_id": object_id, "object_kind": "env", "perm": "use" }))
+            .send()
+    };
+    // Nonexistent env → 404.
+    assert_eq!(grant(&alice_id, "ghost-env").await.unwrap().status().as_u16(), 404);
+
+    let env: Value = c
+        .post(format!("{}/envs", base(port)))
+        .bearer_auth(&admin)
+        .json(&json!({ "name": "e" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let env_id = env["id"].as_str().unwrap().to_string();
+    // Nonexistent user → 404; a valid grant → success.
+    assert_eq!(grant("ghost-user", &env_id).await.unwrap().status().as_u16(), 404);
+    assert!(grant(&alice_id, &env_id).await.unwrap().status().is_success());
+}
+
+/// env update can clear folder_id to null, and rejects a nonexistent folder
+/// with 404 (not a 500/leaky FK error).
+#[tokio::test]
+async fn env_update_clears_folder_and_rejects_bad_folder() {
+    let port = 38088u16;
+    let data = std::env::temp_dir().join(format!("shardx-e2e-envupd-{}", std::process::id()));
+    let _guard = spawn_server(&data, port);
+    let c = client();
+    wait_health(&c, port).await;
+    let admin = token(&c, port, "admin", "secret").await;
+
+    let folder: Value = c
+        .post(format!("{}/folders", base(port)))
+        .bearer_auth(&admin)
+        .json(&json!({ "name": "F" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let folder_id = folder["id"].as_str().unwrap().to_string();
+    let env: Value = c
+        .post(format!("{}/envs", base(port)))
+        .bearer_auth(&admin)
+        .json(&json!({ "name": "e", "folder_id": folder_id }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let env_id = env["id"].as_str().unwrap().to_string();
+    assert_eq!(env["folder_id"].as_str(), Some(folder_id.as_str()));
+
+    let patch = |body: Value| {
+        c.patch(format!("{}/envs/{env_id}", base(port))).bearer_auth(&admin).json(&body).send()
+    };
+    // A nonexistent folder → 404.
+    assert_eq!(patch(json!({ "folder_id": "no-such" })).await.unwrap().status().as_u16(), 404);
+    // Clearing to null succeeds and the env is unfoldered.
+    let r = patch(json!({ "folder_id": Value::Null })).await.unwrap();
+    assert!(r.status().is_success(), "clear folder: {}", r.status());
+    let updated: Value = r.json().await.unwrap();
+    assert!(updated["folder_id"].is_null(), "folder_id cleared to null");
+}
