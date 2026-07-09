@@ -999,6 +999,24 @@ components:
           type: string
           enum: [Strict, Lax, None, unspecified]
           description: Case-insensitive on import.
+        top_frame_site_key:
+          type: string
+          description: >
+            CHIPS partition key — the top-level site a partitioned cookie is
+            scoped to (empty for an unpartitioned cookie). Round-trip it to keep
+            a partitioned cookie's scope on re-import.
+        has_cross_site_ancestor:
+          type: integer
+          nullable: true
+          description: Unique-key component; null → 1 (default).
+        source_scheme:
+          type: integer
+          nullable: true
+          description: Unique-key component; null → derived from `secure`.
+        source_port:
+          type: integer
+          nullable: true
+          description: Unique-key component; null → derived from `secure`.
 
     ProxyEntry:
       type: object
