@@ -181,8 +181,16 @@ async fn checkout_checkin_snapshot_roundtrip() {
         .unwrap();
     assert_eq!(v["version"].as_i64(), Some(1));
     let url = v["snapshot_url"].as_str().unwrap().to_string();
+    let dl_token = v["lock_token"].as_str().unwrap().to_string();
 
-    let resp = c.get(format!("{}{}", base(port), url)).bearer_auth(&admin).send().await.unwrap();
+    let resp = c
+        .get(format!("{}{}", base(port), url))
+        .bearer_auth(&admin)
+        .header("x-client-id", "tester")
+        .header("x-lock-token", &dl_token)
+        .send()
+        .await
+        .unwrap();
     let sha = resp
         .headers()
         .get("x-snapshot-sha256")
@@ -459,4 +467,168 @@ async fn stale_lock_takeover_and_password_invalidation() {
     assert_eq!(resp.status().as_u16(), 401, "old token rejected after password change");
     // new password works
     let _ = token(&c, port, "alice", "pw2").await;
+}
+
+/// Snapshot download must present the current checkout's client_id + lock_token,
+/// not merely be the same user — a second/stale token can't pull the (plaintext)
+/// snapshot out from under the live session.
+#[tokio::test]
+async fn snapshot_download_requires_lock_token() {
+    let port = 38083u16;
+    let data = std::env::temp_dir().join(format!("shardx-e2e-dl-{}", std::process::id()));
+    let _guard = spawn_server(&data, port);
+    let c = client();
+    wait_health(&c, port).await;
+    let admin = token(&c, port, "admin", "secret").await;
+
+    // A member with `use` on an env.
+    c.post(format!("{}/users", base(port)))
+        .bearer_auth(&admin)
+        .json(&json!({ "username": "alice", "password": "pw" }))
+        .send()
+        .await
+        .unwrap();
+    let env: Value = c
+        .post(format!("{}/envs", base(port)))
+        .bearer_auth(&admin)
+        .json(&json!({ "name": "dl" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let env_id = env["id"].as_str().unwrap().to_string();
+    let users: Value = c
+        .get(format!("{}/users", base(port)))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let alice_id = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["username"] == "alice")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.post(format!("{}/acl", base(port)))
+        .bearer_auth(&admin)
+        .json(&json!({ "user_id": alice_id, "object_id": env_id, "object_kind": "env", "perm": "use" }))
+        .send()
+        .await
+        .unwrap();
+    let alice = token(&c, port, "alice", "pw").await;
+
+    // checkout(client a) → checkin (creates v1, releases lock).
+    let srcdir = data.join("dlsrc");
+    std::fs::create_dir_all(&srcdir).unwrap();
+    let snap = shardx_core::snapshot::pack(&srcdir).unwrap();
+    let v0: Value = c
+        .post(format!("{}/envs/{env_id}/checkout", base(port)))
+        .bearer_auth(&alice)
+        .json(&json!({ "client_id": "a" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let tok0 = v0["lock_token"].as_str().unwrap().to_string();
+    let form = reqwest::multipart::Form::new()
+        .text("client_id", "a")
+        .text("lock_token", tok0)
+        .part("snapshot", reqwest::multipart::Part::bytes(snap).file_name("s.tgz"));
+    let r = c
+        .post(format!("{}/envs/{env_id}/checkin", base(port)))
+        .bearer_auth(&alice)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "checkin creates v1");
+
+    // checkout(client a) again → alice holds the lock and v1 exists.
+    let v1: Value = c
+        .post(format!("{}/envs/{env_id}/checkout", base(port)))
+        .bearer_auth(&alice)
+        .json(&json!({ "client_id": "a" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let url = v1["snapshot_url"].as_str().expect("v1 snapshot").to_string();
+    let tok1 = v1["lock_token"].as_str().unwrap().to_string();
+
+    let get = |client_id: &str, lock_token: &str| {
+        c.get(format!("{}{}", base(port), url))
+            .bearer_auth(&alice)
+            .header("x-client-id", client_id.to_string())
+            .header("x-lock-token", lock_token.to_string())
+            .send()
+    };
+    // Correct session → 200.
+    assert_eq!(get("a", &tok1).await.unwrap().status().as_u16(), 200, "lock holder downloads");
+    // Same user, wrong client / wrong token / no headers → refused.
+    assert_eq!(get("b", &tok1).await.unwrap().status().as_u16(), 409, "other client refused");
+    assert_eq!(get("a", "wrong").await.unwrap().status().as_u16(), 409, "wrong token refused");
+    let none = c.get(format!("{}{}", base(port), url)).bearer_auth(&alice).send().await.unwrap();
+    assert_eq!(none.status().as_u16(), 409, "missing session headers refused");
+}
+
+/// A LIVE lock can only be re-acquired by presenting its current lock_token, so
+/// a second JWT for the same user can't learn the client_id, re-checkout, mint a
+/// fresh token, and steal the lock (which would also bypass the download check).
+#[tokio::test]
+async fn reacquiring_live_lock_requires_token() {
+    let port = 38084u16;
+    let data = std::env::temp_dir().join(format!("shardx-e2e-remint-{}", std::process::id()));
+    let _guard = spawn_server(&data, port);
+    let c = client();
+    wait_health(&c, port).await;
+    let admin = token(&c, port, "admin", "secret").await;
+
+    let env: Value = c
+        .post(format!("{}/envs", base(port)))
+        .bearer_auth(&admin)
+        .json(&json!({ "name": "remint" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let env_id = env["id"].as_str().unwrap().to_string();
+
+    let checkout = |tok: Option<&str>| {
+        let mut body = json!({ "client_id": "a" });
+        if let Some(t) = tok {
+            body["lock_token"] = json!(t);
+        }
+        c.post(format!("{}/envs/{env_id}/checkout", base(port)))
+            .bearer_auth(&admin)
+            .json(&body)
+            .send()
+    };
+
+    // First checkout on a free slot needs no token.
+    let v0: Value = checkout(None).await.unwrap().json().await.unwrap();
+    let tok = v0["lock_token"].as_str().unwrap().to_string();
+
+    // Re-acquiring the now-LIVE lock without / with a wrong token is refused.
+    assert_eq!(checkout(None).await.unwrap().status().as_u16(), 409, "no token can't reclaim live lock");
+    assert_eq!(checkout(Some("wrong")).await.unwrap().status().as_u16(), 409, "wrong token refused");
+    // With the real token it succeeds and rotates the token.
+    let v1: Value = checkout(Some(&tok)).await.unwrap().json().await.unwrap();
+    let tok2 = v1["lock_token"].as_str().unwrap().to_string();
+    assert_ne!(tok, tok2, "token rotates on re-acquire");
+    // The old token no longer works.
+    assert_eq!(checkout(Some(&tok)).await.unwrap().status().as_u16(), 409, "old token invalid after rotate");
 }

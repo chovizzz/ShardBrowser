@@ -35,6 +35,16 @@ fn lock_token(body: &Option<Json<ClientReq>>) -> String {
         .unwrap_or_default()
 }
 
+/// Read a request header as an owned string (empty when absent / non-ASCII).
+/// Used by GET routes that can't carry a JSON body (snapshot download).
+fn header_str(headers: &axum::http::HeaderMap, name: &str) -> String {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
 async fn load_lock(app: &AppState, env_id: &str) -> Result<Option<Lock>, AppError> {
     Ok(
         sqlx::query_as::<_, Lock>("SELECT * FROM locks WHERE env_id = ?")
@@ -60,6 +70,7 @@ pub async fn checkout(
     body: Option<Json<ClientReq>>,
 ) -> Result<Json<Value>, AppError> {
     let client = client_id(&body);
+    let presented = lock_token(&body);
     let env = load_accessible(&app, &user, &id, Perm::Use).await?;
 
     // Snapshot of the previous holder, only for the 409 message / takeover
@@ -69,13 +80,20 @@ pub async fn checkout(
     let now = util::now_rfc3339();
     let expires = util::rfc3339_in(app.cfg.lease_ttl_secs);
     let token = util::new_id();
+    // Reclaim a LIVE lock only if the caller proves possession of its current
+    // token — otherwise a second JWT for the same user could learn the (exposed)
+    // client_id, re-checkout, mint a fresh token, and both steal the lock and
+    // bypass the download check. A free slot (INSERT) or an expired lease still
+    // needs no token. `?7 <> ''` also rejects empty/legacy-migrated tokens.
     let res = sqlx::query(
         "INSERT INTO locks (env_id, owner_user_id, owner_client_id, lock_token, acquired_at, lease_expires_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
          ON CONFLICT(env_id) DO UPDATE SET owner_user_id=excluded.owner_user_id, \
            owner_client_id=excluded.owner_client_id, lock_token=excluded.lock_token, \
            acquired_at=excluded.acquired_at, lease_expires_at=excluded.lease_expires_at \
-         WHERE (locks.owner_user_id = excluded.owner_user_id AND locks.owner_client_id = excluded.owner_client_id) \
+         WHERE (locks.owner_user_id = excluded.owner_user_id \
+                AND locks.owner_client_id = excluded.owner_client_id \
+                AND locks.lock_token = ?7 AND ?7 <> '') \
             OR locks.lease_expires_at <= ?5",
     )
     .bind(&id)
@@ -84,6 +102,7 @@ pub async fn checkout(
     .bind(&token)
     .bind(&now)
     .bind(&expires)
+    .bind(&presented)
     .execute(&app.db)
     .await?;
 
@@ -393,16 +412,37 @@ pub async fn download(
     State(app): State<AppState>,
     user: AuthUser,
     Path((id, version)): Path<(String, i64)>,
+    headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     let _ = load_accessible(&app, &user, &id, Perm::Use).await?;
     if !user.is_admin() {
-        let holds = load_lock(&app, &id)
-            .await?
-            .map(|l| l.owner_user_id == user.id)
-            .unwrap_or(false);
-        if !holds {
+        // Require the exact current checkout session — the owner's `client_id`
+        // AND `lock_token`, presented as headers — not merely the same user. A
+        // second/stale token of the owner must not be able to pull the snapshot
+        // (which carries plaintext cookies + payment secrets) out from under the
+        // live session, or after the lock has moved on.
+        let client_id = header_str(&headers, "x-client-id");
+        let lock_token = header_str(&headers, "x-lock-token");
+        // Empty token never grants access — it would otherwise match a legacy
+        // migrated lock row whose token defaulted to ''.
+        if lock_token.is_empty() {
             return Err(AppError::Conflict(
-                "snapshot download requires holding the checkout lock".into(),
+                "snapshot download requires the current checkout's client_id + lock_token".into(),
+            ));
+        }
+        let holds: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM locks WHERE env_id = ? AND owner_user_id = ? \
+             AND owner_client_id = ? AND lock_token = ?",
+        )
+        .bind(&id)
+        .bind(&user.id)
+        .bind(&client_id)
+        .bind(&lock_token)
+        .fetch_optional(&app.db)
+        .await?;
+        if holds.is_none() {
+            return Err(AppError::Conflict(
+                "snapshot download requires the current checkout's client_id + lock_token".into(),
             ));
         }
     }
@@ -415,7 +455,20 @@ pub async fn download(
     .await?
     .ok_or(AppError::NotFound)?;
     let bytes = blob::read(&snap.blob_path).await.map_err(AppError::from)?;
-    audit::log(&app.db, Some(&user.id), "snapshot_download", Some(&id), &format!("v{version}")).await;
+    // Distinguish an admin break-glass download (bypasses the lock check) from a
+    // normal lock-holder pull, and record who currently holds the lock.
+    let detail = if user.is_admin() {
+        let holder = load_lock(&app, &id)
+            .await
+            .ok()
+            .flatten()
+            .map(|l| format!("{}/{}", l.owner_user_id, l.owner_client_id))
+            .unwrap_or_else(|| "none".into());
+        format!("v{version} admin_bypass=true lock_holder={holder}")
+    } else {
+        format!("v{version}")
+    };
+    audit::log(&app.db, Some(&user.id), "snapshot_download", Some(&id), &detail).await;
     Ok((
         [
             (header::CONTENT_TYPE, "application/octet-stream".to_string()),

@@ -318,13 +318,16 @@ pub async fn lock_status(env_id: &str) -> Result<Value> {
 }
 
 /// Acquire the lock. Returns the checkout metadata (lock_token, version,
-/// snapshot_url, stale_takeover).
-async fn checkout_meta(env_id: &str) -> Result<Value> {
+/// snapshot_url, stale_takeover). Presents any persisted lock_token so the
+/// server lets this same client re-acquire its own still-live lock (e.g. a
+/// relaunch after a crash) — a first/free checkout just sends an empty one.
+async fn checkout_meta(profile_id: &str, env_id: &str) -> Result<Value> {
     let (_, _, client_id) = config()?;
+    let lock_token = stored_lock_token(profile_id).unwrap_or_default();
     req(
         "POST",
         &format!("/envs/{env_id}/checkout"),
-        Some(json!({ "client_id": client_id })),
+        Some(json!({ "client_id": client_id, "lock_token": lock_token })),
     )
     .await
 }
@@ -361,11 +364,17 @@ pub async fn release(profile_id: &str, env_id: &str) -> Result<Value> {
 
 /// Download a snapshot and verify its bytes against the server's advertised
 /// sha256 (`x-snapshot-sha256`) before handing them to unpack.
-async fn download(url_path: &str) -> Result<Vec<u8>> {
-    let (server, token, _) = config()?;
+async fn download(profile_id: &str, url_path: &str) -> Result<Vec<u8>> {
+    let (server, token, client_id) = config()?;
+    // Present this checkout session's client_id + lock_token: the server limits
+    // snapshot download (plaintext cookies + payment secrets) to the exact
+    // session holding the lock, not just any token of the same user.
+    let lock_token = stored_lock_token(profile_id).unwrap_or_default();
     let resp = http()?
         .get(format!("{server}{url_path}"))
         .bearer_auth(&token)
+        .header("x-client-id", client_id)
+        .header("x-lock-token", lock_token)
         .send()
         .await
         .context("snapshot download failed")?;
@@ -421,7 +430,7 @@ async fn upload(profile_id: &str, env_id: &str, bytes: Vec<u8>) -> Result<Value>
 /// the checkout metadata. If anything after the lock is acquired fails, the
 /// lock is released so the environment doesn't stay stuck until lease expiry.
 pub async fn pull(profile_id: &str, env_id: &str) -> Result<Value> {
-    let meta = checkout_meta(env_id).await?;
+    let meta = checkout_meta(profile_id, env_id).await?;
     let lock_token = meta.get("lock_token").and_then(|t| t.as_str()).map(String::from);
     let version = meta.get("version").and_then(|v| v.as_i64());
     set_checkout_state(profile_id, lock_token, version);
@@ -432,7 +441,7 @@ pub async fn pull(profile_id: &str, env_id: &str) -> Result<Value> {
             // renewer only starts once the engine spawns, so a slow pull of a
             // large snapshot could otherwise outlive the lease we just acquired.
             let _guard = LeaseGuard::start(profile_id, env_id);
-            let bytes = download(url).await?;
+            let bytes = download(profile_id, url).await?;
             let udd = profile::user_data_dir(profile_id)?;
             // pack/unpack do blocking fs + sqlite work; keep off the async runtime.
             tokio::task::spawn_blocking(move || shardx_core::snapshot::unpack(&bytes, &udd))
@@ -507,7 +516,7 @@ pub async fn retry_push(profile_id: &str, env_id: &str) -> Result<Value> {
     let base_version = profile::load_raw(profile_id).ok().and_then(|p| p.meta.remote_base_version);
 
     // Re-acquire the lock (do NOT pull — that would overwrite local changes).
-    let meta = checkout_meta(env_id).await?;
+    let meta = checkout_meta(profile_id, env_id).await?;
     let lock_token = meta.get("lock_token").and_then(|t| t.as_str()).map(String::from);
     let server_version = meta.get("version").and_then(|v| v.as_i64());
     // Keep the same base so a subsequent retry still compares correctly.

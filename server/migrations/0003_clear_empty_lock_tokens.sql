@@ -1,0 +1,11 @@
+-- Migration 0002 added `lock_token` with a NON-NULL default of '' (empty), so
+-- any lock row that predated it carries an empty token. An empty token can't be
+-- authenticated: checkout re-mint and snapshot download explicitly reject it,
+-- and lease/checkin/release match on `lock_token = ?` — so once no empty-token
+-- row remains they can't act on one either. Left in place, such a legacy lock
+-- would stay weakly held until its lease expired. Clear them on upgrade: the
+-- environment just becomes re-checkoutable, the correct outcome for a stale lock.
+--
+-- This is safe because `checkout` always mints a fresh UUID token (never ''), so
+-- no NEW empty-token lock can be created — after this runs once, none exist.
+DELETE FROM locks WHERE lock_token = '' OR lock_token IS NULL;
