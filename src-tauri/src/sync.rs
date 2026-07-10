@@ -436,24 +436,46 @@ async fn download(profile_id: &str, url_path: &str) -> Result<Vec<u8>> {
         }
         break resp;
     };
-    if !resp.status().is_success() {
+    // Snapshot download is a plain GET of one blob — only 200 carries the body
+    // we expect. Refuse any other 2xx (a 204/206/etc. from a proxy or a future
+    // server would otherwise reach the integrity check with the wrong body).
+    if resp.status() != reqwest::StatusCode::OK {
         return Err(anyhow!("download {url_path} failed: {}", resp.status()));
     }
-    let expected = resp
-        .headers()
-        .get("x-snapshot-sha256")
-        .and_then(|h| h.to_str().ok())
-        .map(str::to_owned);
+    // Fail closed on the integrity header: the snapshot carries decrypted
+    // cookies / saved passwords / card numbers, so a missing or malformed
+    // `x-snapshot-sha256` (e.g. a proxy stripped it, or a non-canonical server)
+    // must abort rather than hand unverified bytes to unpack. The server always
+    // sends it (NOT NULL column), so requiring it costs nothing against it.
+    let expected = expected_snapshot_sha256(
+        resp.headers().get("x-snapshot-sha256").and_then(|h| h.to_str().ok()),
+    )
+    .with_context(|| format!("download {url_path}"))?;
     let bytes = resp.bytes().await?.to_vec();
-    if let Some(expected) = expected {
-        let got = format!("{:x}", Sha256::digest(&bytes));
-        if !got.eq_ignore_ascii_case(&expected) {
-            return Err(anyhow!(
-                "snapshot integrity check failed: expected {expected}, got {got}"
-            ));
-        }
-    }
+    verify_snapshot_sha256(&expected, &bytes)?;
     Ok(bytes)
+}
+
+/// Parse + validate the server's `x-snapshot-sha256` header into the normalized
+/// (lowercase) 64-char hex digest. A missing, blank, or malformed value is an
+/// error — we must not accept the sensitive snapshot bytes unverified.
+fn expected_snapshot_sha256(raw: Option<&str>) -> Result<String> {
+    let v = raw.map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| {
+        anyhow!("snapshot response missing x-snapshot-sha256 integrity header — refusing unverified bytes")
+    })?;
+    if v.len() != 64 || !v.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(anyhow!("snapshot response has a malformed x-snapshot-sha256 header"));
+    }
+    Ok(v.to_ascii_lowercase())
+}
+
+/// Verify snapshot bytes against the expected (already-normalized) sha256 hex.
+fn verify_snapshot_sha256(expected: &str, bytes: &[u8]) -> Result<()> {
+    let got = format!("{:x}", Sha256::digest(bytes));
+    if !got.eq_ignore_ascii_case(expected) {
+        return Err(anyhow!("snapshot integrity check failed: expected {expected}, got {got}"));
+    }
+    Ok(())
 }
 
 /// Multipart checkin upload. The session identity (client_id + lock_token) goes
@@ -713,5 +735,29 @@ mod tests {
         // ...but a FAILED renewal retries quickly, never a wide fixed gap that a
         // short TTL could outlast.
         assert_eq!(interval_after(&Err(anyhow::anyhow!("network down"))).as_secs(), 5);
+    }
+
+    #[test]
+    fn snapshot_sha256_header_is_required_and_validated() {
+        use super::{expected_snapshot_sha256 as parse, verify_snapshot_sha256 as verify};
+        use sha2::{Digest, Sha256};
+
+        let valid = "a".repeat(64);
+        // A well-formed header parses; case is normalized and whitespace trimmed.
+        assert_eq!(parse(Some(&valid)).unwrap(), valid);
+        assert_eq!(parse(Some(&"A".repeat(64))).unwrap(), valid);
+        assert_eq!(parse(Some(&format!("  {valid}\t"))).unwrap(), valid);
+        // Missing / blank / malformed all fail closed.
+        assert!(parse(None).is_err(), "absent header must error");
+        assert!(parse(Some("   ")).is_err(), "blank header must error");
+        assert!(parse(Some("abc")).is_err(), "too-short header must error");
+        assert!(parse(Some(&"g".repeat(64))).is_err(), "non-hex header must error");
+        assert!(parse(Some(&"a".repeat(63))).is_err(), "63 hex chars must error");
+
+        // verify: exact digest passes, anything else fails.
+        let bytes = b"snapshot-body";
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        assert!(verify(&digest, bytes).is_ok());
+        assert!(verify(&"0".repeat(64), bytes).is_err(), "mismatch must error");
     }
 }
