@@ -63,26 +63,49 @@ impl Default for PortableCookie {
     }
 }
 
-/// Decrypted saved login (Chromium `Login Data` → `logins`). Reserved for a
-/// later phase; snapshots currently normalize cookies only.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A decrypted saved password (Chromium `Login Data` → `logins`), carried in a
+/// snapshot so it can be re-sealed with the destination machine's os_crypt key
+/// on restore. The raw DB travels with the snapshot; only the `password_value`
+/// column is rekeyed in place, located by the row's stable SQLite `rowid` (the
+/// file travels unchanged, so rowids match between pack and unpack). The value
+/// is the raw decrypted bytes — not a `String`, so an arbitrary-byte password
+/// survives the round-trip intact.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PortableLogin {
-    pub origin_url: String,
-    pub username_value: String,
-    pub password_value: String,
-    #[serde(default)]
-    pub signon_realm: String,
+    pub rowid: i64,
+    pub password_value: Vec<u8>,
+}
+
+// Hand-written so a decrypted password never lands in a log line.
+impl std::fmt::Debug for PortableLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PortableLogin")
+            .field("rowid", &self.rowid)
+            .field("password_value", &format_args!("<{} bytes redacted>", self.password_value.len()))
+            .finish()
+    }
 }
 
 /// A decrypted `Web Data` secret (a credit-card number, CVC, or IBAN), carried
 /// in a snapshot so it can be re-sealed with the destination machine's os_crypt
 /// key on restore. `table` + `key` (the row's `guid`) locate the exact row to
 /// rewrite; `value` is the raw decrypted bytes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PortableSecret {
     pub table: String,
     pub key: String,
     pub value: Vec<u8>,
+}
+
+// Hand-written so a decrypted card number / CVC never lands in a log line.
+impl std::fmt::Debug for PortableSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PortableSecret")
+            .field("table", &self.table)
+            .field("key", &self.key)
+            .field("value", &format_args!("<{} bytes redacted>", self.value.len()))
+            .finish()
+    }
 }
 
 /// The plaintext, portable slice of a profile's state embedded in a snapshot

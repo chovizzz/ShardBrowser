@@ -16,6 +16,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 
 use crate::cookies;
+use crate::logins;
 use crate::oscrypt::LocalCrypt;
 use crate::portable::{PortableState, PORTABLE_FILE};
 use crate::webdata;
@@ -39,11 +40,15 @@ const EXCLUDE_PREFIXES: &[&str] = &[
     "Default/Service Worker/ScriptCache",
     "Default/Cookies",         // rebuilt from portable plaintext
     "Default/Network/Cookies", // rebuilt from portable plaintext
-    // Saved passwords are encrypted with the machine-bound key and are NOT
-    // ported in v1 (logins stay empty in PortableState); carrying the raw DB
-    // across machines would leave an undecryptable file behind.
-    "Default/Login Data",
+    // `Default/Login Data` (saved passwords) is NOT excluded: like Web Data the
+    // raw DB + its `-wal`/`-shm` travel, and unpack re-seals `password_value` in
+    // place with the destination key. But the account-bound `Login Data For
+    // Account` re-syncs from the signed-in Google account on the destination, so
+    // it's excluded — including its `-wal`/`-shm`, which the `p/`-prefix match
+    // below would not catch (they aren't a `p/` child of the base name).
     "Default/Login Data For Account",
+    "Default/Login Data For Account-wal",
+    "Default/Login Data For Account-shm",
     "GPUCache",
     "ShaderCache",
     "GrShaderCache",
@@ -54,9 +59,11 @@ const EXCLUDE_PREFIXES: &[&str] = &[
 
 /// Exclusion match. Comparisons are ASCII-case-insensitive: Windows and the
 /// default macOS filesystem are case-insensitive, so `local state` /
-/// `Default/login data` would alias the excluded (and never-rebuilt) machine-key
-/// and Login Data files. Callers pass the canonical `rel` from `normalize_rel`,
-/// so `.`/empty/leading-root variants are already collapsed before we get here.
+/// `default/login data for account` would alias the excluded machine-key /
+/// account-bound files. (`Default/Login Data` itself is NOT excluded — it and
+/// its `-wal`/`-shm` travel and are rekeyed in place.) Callers pass the
+/// canonical `rel` from `normalize_rel`, so `.`/empty/leading-root variants are
+/// already collapsed before we get here.
 fn is_excluded(rel: &str) -> bool {
     for p in EXCLUDE_PREFIXES {
         let (rb, pb) = (rel.as_bytes(), p.as_bytes());
@@ -103,7 +110,11 @@ pub fn pack(udd: &Path) -> Result<Vec<u8>> {
     // they can be re-sealed on the destination; the raw DB itself still travels.
     let web_secrets = webdata::read(&webdata::web_data_path(udd), &crypt)
         .context("read Web Data secrets for snapshot")?;
-    let state = PortableState { cookies, logins: Vec::new(), web_secrets };
+    // Decrypt saved passwords the same way — the raw `Login Data` DB travels and
+    // only `password_value` is rekeyed on restore, keyed by rowid.
+    let logins = logins::read(&logins::login_data_path(udd), &crypt)
+        .context("read saved logins for snapshot")?;
+    let state = PortableState { cookies, logins, web_secrets };
     let state_json = serde_json::to_vec(&state)?;
 
     let gz = GzEncoder::new(Vec::new(), Compression::default());
@@ -418,6 +429,12 @@ fn build_staging(bytes: &[u8], udd: &Path, staging: &Path) -> Result<PortableSta
     // place, keyed by each row's guid — the rest of its tables are left intact.
     webdata::reencrypt_in_place(&webdata::web_data_path(staging), &crypt, &state.web_secrets)
         .context("re-encrypt Web Data secrets")?;
+
+    // Re-seal saved passwords with this machine's key. Like Web Data, the raw
+    // `Login Data` DB traveled; only `password_value` is rekeyed in place by
+    // rowid, then the WAL is checkpointed so the staged DB is self-contained.
+    logins::reencrypt_in_place(&logins::login_data_path(staging), &crypt, &state.logins)
+        .context("re-encrypt saved logins")?;
     Ok(state)
 }
 
@@ -575,13 +592,13 @@ mod tests {
         // longname carrying the crafted path.
         let evil_marker = b"ATTACKER-CONTROLLED";
         let evil_names = [
-            "/Local State",             // leading root → excluded machine key
-            "./Local State",            // `.` segment → same
-            "Default/./Login Data",     // interior `.` → excluded, never rebuilt
-            "local state",              // case alias on Win/macOS
-            "Default/login data",       // case alias, excluded
-            "Default/Network/Cookies/", // trailing slash
-            "Local State/foo",          // dir at the protected file path
+            "/Local State",                        // leading root → excluded machine key
+            "./Local State",                       // `.` segment → same
+            "Default/./Login Data For Account",    // interior `.` → excluded, account-bound
+            "local state",                         // case alias on Win/macOS
+            "Default/login data for account",      // case alias, excluded
+            "Default/Network/Cookies/",            // trailing slash
+            "Local State/foo",                     // dir at the protected file path
         ];
 
         let gz = GzEncoder::new(Vec::new(), Compression::default());
@@ -621,7 +638,7 @@ mod tests {
         // Unpack succeeds (valid portable state); the crafted entries are matched
         // on their canonical form and dropped as excluded — none plants its marker.
         unpack(&bytes, &dst).unwrap();
-        for planted in ["Local State", "Default/Login Data", "Default/login data"] {
+        for planted in ["Local State", "Default/Login Data For Account", "Default/login data for account"] {
             let p = dst.join(planted);
             if let Ok(got) = std::fs::read(&p) {
                 assert_ne!(got, evil_marker, "canonicalized path planted attacker bytes at {planted}");
@@ -786,6 +803,96 @@ mod tests {
         let cards = webdata::read(&webdata::web_data_path(&dst), &dcrypt).unwrap();
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].value, b"4111111111111111");
+    }
+
+    #[test]
+    fn pack_unpack_normalizes_saved_passwords() {
+        // End-to-end: a saved password in the source `Login Data` survives
+        // pack→unpack, gets re-sealed with the destination key, and the
+        // account-bound `Login Data For Account` (+ its sidecars) never travel.
+        let base = std::env::temp_dir().join(format!("shardx-snap-lg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let dst = base.join("dst");
+        std::fs::create_dir_all(src.join("Default")).unwrap();
+
+        let scrypt = LocalCrypt::open(&src).unwrap();
+        {
+            let conn = rusqlite::Connection::open(src.join("Default/Login Data")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE logins (origin_url TEXT, username_value TEXT, \
+                 password_value BLOB, signon_realm TEXT);",
+            )
+            .unwrap();
+            let enc = scrypt.encrypt_secret(b"hunter2");
+            conn.execute(
+                "INSERT INTO logins VALUES ('https://site.test/', 'alice', ?1, 'https://site.test/')",
+                rusqlite::params![enc],
+            )
+            .unwrap();
+        }
+        // Account-bound files that must be excluded, incl. their sidecars.
+        std::fs::write(src.join("Default/Login Data For Account"), b"acct").unwrap();
+        std::fs::write(src.join("Default/Login Data For Account-wal"), b"acctwal").unwrap();
+        std::fs::write(src.join("Default/Login Data For Account-shm"), b"acctshm").unwrap();
+
+        let bytes = pack(&src).unwrap();
+        let state = unpack(&bytes, &dst).unwrap();
+        assert_eq!(state.logins.len(), 1, "password carried in portable state");
+
+        // The Login Data DB traveled; the password decrypts with dst's key.
+        let dcrypt = LocalCrypt::open(&dst).unwrap();
+        let got = logins::read(&logins::login_data_path(&dst), &dcrypt).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].password_value, b"hunter2");
+
+        // Account-bound files (and sidecars) were left behind.
+        assert!(!dst.join("Default/Login Data For Account").exists());
+        assert!(!dst.join("Default/Login Data For Account-wal").exists());
+        assert!(!dst.join("Default/Login Data For Account-shm").exists());
+    }
+
+    #[test]
+    fn pack_unpack_carries_password_from_wal() {
+        // A password committed only to `Login Data-wal` (hard-killed checkin, no
+        // checkpoint) must travel in the snapshot and rekey on restore — proving
+        // the `-wal` file itself is packed, not just the main DB.
+        let base = std::env::temp_dir().join(format!("shardx-snap-lgwal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let dst = base.join("dst");
+        std::fs::create_dir_all(src.join("Default")).unwrap();
+
+        let scrypt = LocalCrypt::open(&src).unwrap();
+        // Keep the writer open across pack() so the WAL is never checkpointed
+        // into the main DB before the files are read off disk.
+        let writer = rusqlite::Connection::open(src.join("Default/Login Data")).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        writer.pragma_update(None, "wal_autocheckpoint", 0i64).unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE logins (origin_url TEXT, username_value TEXT, \
+                 password_value BLOB, signon_realm TEXT);",
+            )
+            .unwrap();
+        let enc = scrypt.encrypt_secret(b"walsecret");
+        writer
+            .execute(
+                "INSERT INTO logins VALUES ('https://w.test/', 'u', ?1, 'https://w.test/')",
+                rusqlite::params![enc],
+            )
+            .unwrap();
+        assert!(src.join("Default/Login Data-wal").exists(), "row must be in the WAL");
+
+        let bytes = pack(&src).unwrap();
+        drop(writer);
+        let state = unpack(&bytes, &dst).unwrap();
+        assert_eq!(state.logins.len(), 1);
+
+        let dcrypt = LocalCrypt::open(&dst).unwrap();
+        let got = logins::read(&logins::login_data_path(&dst), &dcrypt).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].password_value, b"walsecret");
     }
 
     #[test]
