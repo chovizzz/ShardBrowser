@@ -69,13 +69,33 @@ fn stored_lock_token(profile_id: &str) -> Option<String> {
     profile::load_raw(profile_id).ok().and_then(|p| p.meta.remote_lock_token)
 }
 
-/// Persist the checkout session (lock_token + base version) on the profile.
-fn set_checkout_state(profile_id: &str, lock_token: Option<String>, base_version: Option<i64>) {
-    if let Ok(mut p) = profile::load_raw(profile_id) {
-        p.meta.remote_lock_token = lock_token;
-        p.meta.remote_base_version = base_version;
-        let _ = profile::save_raw(&mut p);
+/// Marker error: a checkin was attempted for a profile that holds no checkout
+/// lock. The exit hook treats this specially (nothing was checked out, so there
+/// is nothing to check in) — it must NOT mark the profile pending, which would
+/// then block the next launch. Other callers surface it as a plain error.
+#[derive(Debug)]
+struct NoCheckout;
+impl std::fmt::Display for NoCheckout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no checkout lock held for this profile")
     }
+}
+impl std::error::Error for NoCheckout {}
+
+/// Persist the checkout session (lock_token + base version) on the profile.
+/// Returns the save error so callers on the acquire path can fail closed: a
+/// checkout whose token we can't persist must not run a session we could never
+/// check in (its changes would be silently overwritten by the next pull).
+fn set_checkout_state(
+    profile_id: &str,
+    lock_token: Option<String>,
+    base_version: Option<i64>,
+) -> Result<()> {
+    let mut p = profile::load_raw(profile_id)?;
+    p.meta.remote_lock_token = lock_token;
+    p.meta.remote_base_version = base_version;
+    profile::save_raw(&mut p)?;
+    Ok(())
 }
 
 /// Flag/clear the "browser exited but checkin failed" state.
@@ -344,20 +364,30 @@ pub async fn lease(profile_id: &str, env_id: &str) -> Result<Value> {
     .await
 }
 
-/// Release the lock without uploading (discard local changes).
-pub async fn release(profile_id: &str, env_id: &str) -> Result<Value> {
+/// Release a lock using an explicit token (not the persisted one). Used when the
+/// token isn't on disk — e.g. a checkout we couldn't persist but still hold in
+/// memory — so we can free the environment immediately instead of waiting out
+/// the lease TTL. Does not touch persisted state.
+async fn release_with_token(env_id: &str, lock_token: &str) -> Result<Value> {
     let (_, _, client_id) = config()?;
-    let token = stored_lock_token(profile_id).unwrap_or_default();
-    let out = req(
+    req(
         "POST",
         &format!("/envs/{env_id}/release"),
-        Some(json!({ "client_id": client_id, "lock_token": token })),
+        Some(json!({ "client_id": client_id, "lock_token": lock_token })),
     )
-    .await;
+    .await
+}
+
+/// Release the lock without uploading (discard local changes).
+pub async fn release(profile_id: &str, env_id: &str) -> Result<Value> {
+    let token = stored_lock_token(profile_id).unwrap_or_default();
+    let out = release_with_token(env_id, &token).await;
     // Only forget the session if the server actually released it; on a network
-    // blip the lock may still be held, and we need the token to retry.
+    // blip the lock may still be held, and we need the token to retry. Clearing
+    // is best-effort: a failed clear just leaves a stale token the next checkout
+    // reclaims — not data loss.
     if out.is_ok() {
-        set_checkout_state(profile_id, None, None);
+        let _ = set_checkout_state(profile_id, None, None);
     }
     out
 }
@@ -429,9 +459,8 @@ async fn download(profile_id: &str, url_path: &str) -> Result<Vec<u8>> {
 /// Multipart checkin upload. The session identity (client_id + lock_token) goes
 /// in headers, not body parts, so the server can authorize before reading the
 /// snapshot; the multipart body carries only the snapshot file itself.
-async fn upload(profile_id: &str, env_id: &str, bytes: Vec<u8>) -> Result<Value> {
+async fn upload(env_id: &str, lock_token: &str, bytes: Vec<u8>) -> Result<Value> {
     let (server, token, client_id) = config()?;
-    let lock_token = stored_lock_token(profile_id).unwrap_or_default();
     let form = reqwest::multipart::Form::new().part(
         "snapshot",
         reqwest::multipart::Part::bytes(bytes).file_name("snapshot.tgz"),
@@ -461,7 +490,17 @@ pub async fn pull(profile_id: &str, env_id: &str) -> Result<Value> {
     let meta = checkout_meta(profile_id, env_id).await?;
     let lock_token = meta.get("lock_token").and_then(|t| t.as_str()).map(String::from);
     let version = meta.get("version").and_then(|v| v.as_i64());
-    set_checkout_state(profile_id, lock_token, version);
+    // Fail closed if the token can't be persisted: we hold the server lock but
+    // couldn't record it, so the exit hook would find no checkout and skip the
+    // checkin, and the next pull would silently overwrite this session's changes.
+    // Release with the in-hand token so the environment frees immediately (best
+    // effort — the server-side lease reclaims it on TTL expiry regardless).
+    if let Err(e) = set_checkout_state(profile_id, lock_token.clone(), version) {
+        if let Some(tok) = lock_token.filter(|t| !t.is_empty()) {
+            let _ = release_with_token(env_id, &tok).await;
+        }
+        return Err(e).context("persist checkout token for shared environment");
+    }
 
     let result: Result<()> = async {
         if let Some(url) = meta.get("snapshot_url").and_then(|u| u.as_str()) {
@@ -496,15 +535,30 @@ pub async fn pull(profile_id: &str, env_id: &str) -> Result<Value> {
 /// snapshot, and release the lock. A lease guard keeps the checkout alive
 /// while a large snapshot packs and uploads.
 pub async fn push(profile_id: &str, env_id: &str) -> Result<Value> {
+    // A checkin without a lock is guaranteed to be rejected server-side, so
+    // refuse before doing any lease/pack/upload work. Read the token ONCE and
+    // carry it through to upload, so a concurrent release/discard between reads
+    // can't turn this into a doomed empty-token upload. The `NoCheckout` marker
+    // lets the exit hook tell "nothing to check in" apart from a real failure
+    // (and so avoid a spurious pending flag); every caller (exit hook, retry, UI
+    // remote_push) is guarded against checking in with no checkout.
+    let lock_token = stored_lock_token(profile_id).filter(|t| !t.is_empty());
+    let Some(lock_token) = lock_token else {
+        // Full sentence in the OUTERMOST context so a UI caller's `.to_string()`
+        // shows it; the `NoCheckout` marker underneath stays downcastable.
+        return Err(anyhow::Error::new(NoCheckout)
+            .context(format!("cannot check in {env_id}: no checkout lock held for this profile")));
+    };
     let _guard = LeaseGuard::start(profile_id, env_id);
     let udd = profile::user_data_dir(profile_id)?;
     let bytes = tokio::task::spawn_blocking(move || shardx_core::snapshot::pack(&udd))
         .await
         .map_err(|e| anyhow!("pack task: {e}"))?
         .map_err(|e| anyhow!("pack snapshot: {e}"))?;
-    let out = upload(profile_id, env_id, bytes).await?;
-    // Checked in cleanly — clear the session + any pending flag.
-    set_checkout_state(profile_id, None, None);
+    let out = upload(env_id, &lock_token, bytes).await?;
+    // Checked in cleanly — clear the session + any pending flag. Clearing is
+    // best-effort: a stale token left behind is reclaimed by the next checkout.
+    let _ = set_checkout_state(profile_id, None, None);
     set_pending_push(profile_id, false);
     Ok(out)
 }
@@ -515,6 +569,17 @@ pub async fn push(profile_id: &str, env_id: &str) -> Result<Value> {
 pub async fn checkin_on_exit(profile_id: &str, env_id: &str) {
     match push(profile_id, env_id).await {
         Ok(_) => eprintln!("[launcher] checked in shared environment {env_id}"),
+        // No checkout was held (e.g. the profile was launched before the team
+        // server was configured, so `launch` never checked it out, and the
+        // server was configured mid-session). Nothing was checked out, so there
+        // is nothing to check in — do NOT mark pending, which would block the
+        // next launch. `push` guards before any pack/upload, so this is free.
+        // Classifying the marker (rather than pre-checking the token) also closes
+        // the TOCTOU where a concurrent release/discard clears the token between
+        // a pre-check and the push.
+        Err(e) if e.downcast_ref::<NoCheckout>().is_some() => {
+            eprintln!("[launcher] env {env_id}: no checkout held on exit — nothing to check in");
+        }
         Err(e) => {
             eprintln!("[launcher] checkin failed for env {env_id}: {e} — marked pending");
             set_pending_push(profile_id, true);
@@ -529,7 +594,7 @@ pub async fn discard_pending(profile_id: &str, env_id: &str) -> Result<()> {
     if stored_lock_token(profile_id).is_some() {
         let _ = release(profile_id, env_id).await;
     }
-    set_checkout_state(profile_id, None, None);
+    let _ = set_checkout_state(profile_id, None, None);
     set_pending_push(profile_id, false);
     Ok(())
 }
@@ -547,8 +612,17 @@ pub async fn retry_push(profile_id: &str, env_id: &str) -> Result<Value> {
     let meta = checkout_meta(profile_id, env_id).await?;
     let lock_token = meta.get("lock_token").and_then(|t| t.as_str()).map(String::from);
     let server_version = meta.get("version").and_then(|v| v.as_i64());
-    // Keep the same base so a subsequent retry still compares correctly.
-    set_checkout_state(profile_id, lock_token, base_version);
+    // Keep the same base so a subsequent retry still compares correctly. Fail
+    // closed if the re-acquired token can't be persisted — otherwise the push
+    // below would find no checkout and the pending changes would be stranded.
+    // Release the freshly re-acquired token so a later retry isn't stuck sending
+    // the (now superseded) old token until the lease lapses.
+    if let Err(e) = set_checkout_state(profile_id, lock_token.clone(), base_version) {
+        if let Some(tok) = lock_token.filter(|t| !t.is_empty()) {
+            let _ = release_with_token(env_id, &tok).await;
+        }
+        return Err(e).context("persist re-acquired checkout token");
+    }
 
     if let (Some(base), Some(server)) = (base_version, server_version) {
         if server != base {
@@ -556,7 +630,7 @@ pub async fn retry_push(profile_id: &str, env_id: &str) -> Result<Value> {
             if let Err(re) = release(profile_id, env_id).await {
                 eprintln!("[launcher] release after retry conflict failed for {env_id}: {re}");
             }
-            set_checkout_state(profile_id, None, base_version);
+            let _ = set_checkout_state(profile_id, None, base_version);
             return Err(anyhow!(
                 "cannot push: the shared environment was updated by someone else \
                  (server v{server}, your changes are based on v{base}). Your local \
