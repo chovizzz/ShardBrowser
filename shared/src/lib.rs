@@ -12,6 +12,7 @@ pub mod logins;
 pub mod oscrypt;
 pub mod portable;
 pub mod snapshot;
+pub mod webdata;
 
 pub use oscrypt::LocalCrypt;
-pub use portable::{PortableCookie, PortableLogin, PortableState};
+pub use portable::{PortableCookie, PortableLogin, PortableSecret, PortableState};

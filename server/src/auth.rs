@@ -2,13 +2,17 @@ use argon2::password_hash::{
     rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
 };
 use argon2::Argon2;
-use axum::extract::{FromRef, FromRequestParts, State};
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, FromRef, FromRequestParts, State};
 use axum::http::request::Parts;
+use axum::http::HeaderMap;
 use axum::{async_trait, Json};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::extract::AppJson;
 use crate::db;
 use crate::error::AppError;
 use crate::models::LoginReq;
@@ -29,6 +33,24 @@ pub fn verify_password(password: &str, hash: &str) -> Result<(), AppError> {
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .map_err(|_| AppError::Unauthorized)
+}
+
+/// Argon2 is CPU-heavy by design; run every hash/verify under the shared login
+/// throttle (bounds concurrency → 429 when saturated) and on the blocking pool
+/// (so it never ties up an async worker). Every password-touching route MUST go
+/// through these, not the sync `hash_password`/`verify_password` directly.
+pub async fn verify_slot(app: &AppState, password: String, hash: String) -> Result<bool, AppError> {
+    let _slot = app.login_throttle.try_verify_slot().ok_or(AppError::TooManyRequests(1))?;
+    tokio::task::spawn_blocking(move || verify_password(&password, &hash).is_ok())
+        .await
+        .map_err(|e| AppError::Internal(format!("verify task: {e}")))
+}
+
+pub async fn hash_slot(app: &AppState, password: String) -> Result<String, AppError> {
+    let _slot = app.login_throttle.try_verify_slot().ok_or(AppError::TooManyRequests(1))?;
+    tokio::task::spawn_blocking(move || hash_password(&password))
+        .await
+        .map_err(|e| AppError::Internal(format!("hash task: {e}")))?
 }
 
 // ---- JWT (HS256) ----
@@ -128,21 +150,64 @@ where
 
 // ---- handlers ----
 
+/// Resolve the client IP for throttling. Trusts `X-Forwarded-For` / `X-Real-IP`
+/// only when `SHARDX_TRUST_PROXY=1` (i.e. behind an edge proxy that OVERWRITES
+/// the inbound header) — otherwise a client could spoof it to dodge the per-IP
+/// limit. The header value must parse as an IP or it's ignored.
+fn client_ip(app: &AppState, headers: &HeaderMap, peer: SocketAddr) -> String {
+    if app.cfg.trust_proxy {
+        for header in ["x-forwarded-for", "x-real-ip"] {
+            if let Some(raw) = headers.get(header).and_then(|v| v.to_str().ok()) {
+                let first = raw.split(',').next().unwrap_or("").trim();
+                // Return the parsed IP's canonical form so the same address in
+                // different text spellings maps to one throttle key.
+                if let Ok(addr) = first.parse::<std::net::IpAddr>() {
+                    return addr.to_string();
+                }
+            }
+        }
+    }
+    peer.ip().to_string()
+}
+
 pub async fn login(
     State(app): State<AppState>,
-    Json(req): Json<LoginReq>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    AppJson(req): AppJson<LoginReq>,
 ) -> Result<Json<Value>, AppError> {
+    let ip = client_ip(&app, &headers, peer);
+    // Raw username: accounts are case-sensitive, so a case variant targets a
+    // different (usually nonexistent) account, not this one.
+    let user_key = req.username.clone();
+
+    // Throttle BEFORE any DB lookup or Argon2, so a locked-out source can't
+    // drive brute force. `locked_for` returns the longer of the IP/user waits.
+    if let Some(retry) = app.login_throttle.locked_for(&ip, &user_key) {
+        return Err(AppError::TooManyRequests(retry));
+    }
+
     let user = match db::find_user_by_name(&app.db, &req.username).await? {
         Some(u) => u,
         None => {
-            crate::audit::log(&app.db, None, "login_failed", None, &req.username).await;
+            app.login_throttle.record_failure(&ip, &user_key);
+            let detail = format!("{} from {ip}", req.username);
+            crate::audit::log(&app.db, None, "login_failed", None, &detail).await;
             return Err(AppError::Unauthorized);
         }
     };
-    if verify_password(&req.password, &user.pw_hash).is_err() {
-        crate::audit::log(&app.db, Some(&user.id), "login_failed", None, &user.username).await;
+
+    // Throttled + off-runtime Argon2 (see `verify_slot`): bounds a concurrent
+    // first wave that all passed `locked_for` before any was recorded.
+    let verified = verify_slot(&app, req.password.clone(), user.pw_hash.clone()).await?;
+    if !verified {
+        app.login_throttle.record_failure(&ip, &user_key);
+        let detail = format!("{} from {ip}", user.username);
+        crate::audit::log(&app.db, Some(&user.id), "login_failed", None, &detail).await;
         return Err(AppError::Unauthorized);
     }
+    // Success clears the failure history for this IP + account.
+    app.login_throttle.record_success(&ip, &user_key);
     let token = issue(
         &app.cfg.token_secret,
         &user.id,
@@ -165,7 +230,7 @@ pub async fn me(user: AuthUser) -> Json<Value> {
 pub async fn change_password(
     State(app): State<AppState>,
     user: AuthUser,
-    Json(req): Json<crate::models::ChangePasswordReq>,
+    AppJson(req): AppJson<crate::models::ChangePasswordReq>,
 ) -> Result<Json<Value>, AppError> {
     if req.new_password.is_empty() {
         return Err(AppError::BadRequest("new password required".into()));
@@ -173,8 +238,10 @@ pub async fn change_password(
     let row = db::find_user(&app.db, &user.id)
         .await?
         .ok_or(AppError::Unauthorized)?;
-    verify_password(&req.old_password, &row.pw_hash)?;
-    let hash = hash_password(&req.new_password)?;
+    if !verify_slot(&app, req.old_password, row.pw_hash.clone()).await? {
+        return Err(AppError::Unauthorized);
+    }
+    let hash = hash_slot(&app, req.new_password).await?;
     sqlx::query("UPDATE users SET pw_hash = ?, token_version = token_version + 1 WHERE id = ?")
         .bind(&hash)
         .bind(&user.id)

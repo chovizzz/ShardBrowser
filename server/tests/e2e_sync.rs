@@ -44,8 +44,8 @@ async fn wait_health(c: &reqwest::Client, port: u16) {
     panic!("server did not become healthy on port {port}");
 }
 
-/// Spawn a server on a fresh data dir. Lease TTL is 1s so the stale-takeover
-/// test doesn't have to wait the default 90s.
+/// Spawn a server on a fresh data dir. The stale-takeover test ages the lease
+/// row directly (the server floors the TTL at 15s), so this uses a normal TTL.
 fn spawn_server(data: &std::path::Path, port: u16) -> ServerGuard {
     let _ = std::fs::remove_dir_all(data);
     let bin = env!("CARGO_BIN_EXE_shardx-team-server");
@@ -56,7 +56,7 @@ fn spawn_server(data: &std::path::Path, port: u16) -> ServerGuard {
         .env("SHARDX_ADMIN_USER", "admin")
         .env("SHARDX_ADMIN_PASS", "secret")
         .env("SHARDX_SNAPSHOT_KEEP", "3")
-        .env("SHARDX_LEASE_TTL_SECS", "1")
+        .env("SHARDX_LEASE_TTL_SECS", "20")
         .spawn()
         .expect("spawn server binary");
     ServerGuard(child)
@@ -118,6 +118,7 @@ async fn checkout_checkin_snapshot_roundtrip() {
             secure: true,
             http_only: true,
             same_site: Some("Lax".into()),
+            ..Default::default()
         }],
     )
     .unwrap();
@@ -140,12 +141,12 @@ async fn checkout_checkin_snapshot_roundtrip() {
 
     // checkin with a WRONG token is rejected (stale-session protection)
     let bad = reqwest::multipart::Form::new()
-        .text("client_id", "tester")
-        .text("lock_token", "not-the-token")
         .part("snapshot", reqwest::multipart::Part::bytes(snapshot.clone()).file_name("s.tgz"));
     let resp = c
         .post(format!("{}/envs/{env_id}/checkin", base(port)))
         .bearer_auth(&admin)
+        .header("x-client-id", "tester")
+        .header("x-lock-token", "not-the-token")
         .multipart(bad)
         .send()
         .await
@@ -154,12 +155,12 @@ async fn checkout_checkin_snapshot_roundtrip() {
 
     // checkin with the RIGHT token, exactly as sync.rs::upload builds it
     let form = reqwest::multipart::Form::new()
-        .text("client_id", "tester")
-        .text("lock_token", lock_token)
         .part("snapshot", reqwest::multipart::Part::bytes(snapshot).file_name("snapshot.tgz"));
     let resp = c
         .post(format!("{}/envs/{env_id}/checkin", base(port)))
         .bearer_auth(&admin)
+        .header("x-client-id", "tester")
+        .header("x-lock-token", lock_token)
         .multipart(form)
         .send()
         .await
@@ -181,8 +182,16 @@ async fn checkout_checkin_snapshot_roundtrip() {
         .unwrap();
     assert_eq!(v["version"].as_i64(), Some(1));
     let url = v["snapshot_url"].as_str().unwrap().to_string();
+    let dl_token = v["lock_token"].as_str().unwrap().to_string();
 
-    let resp = c.get(format!("{}{}", base(port), url)).bearer_auth(&admin).send().await.unwrap();
+    let resp = c
+        .get(format!("{}{}", base(port), url))
+        .bearer_auth(&admin)
+        .header("x-client-id", "tester")
+        .header("x-lock-token", &dl_token)
+        .send()
+        .await
+        .unwrap();
     let sha = resp
         .headers()
         .get("x-snapshot-sha256")
@@ -403,8 +412,23 @@ async fn stale_lock_takeover_and_password_invalidation() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 409, "live lease blocks others");
 
-    // lease TTL is 1s; wait it out, then bob takes over
-    tokio::time::sleep(Duration::from_millis(1300)).await;
+    // Expire alice's lease by aging the row directly — the server floors the
+    // TTL at 15s, too long to wait out in a test — then bob takes over.
+    {
+        use std::str::FromStr;
+        let db = data.join("shardx.db");
+        let opts = sqlx::sqlite::SqliteConnectOptions::from_str(&format!("sqlite://{}", db.display()))
+            .unwrap()
+            .busy_timeout(Duration::from_secs(5));
+        let pool = sqlx::SqlitePool::connect_with(opts).await.unwrap();
+        let n = sqlx::query("UPDATE locks SET lease_expires_at = '2000-01-01T00:00:00+00:00'")
+            .execute(&pool)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(n, 1, "aged exactly alice's lease");
+        pool.close().await;
+    }
     let b: Value = c
         .post(format!("{}/envs/{env_id}/checkout", base(port)))
         .bearer_auth(&bob)
@@ -419,12 +443,12 @@ async fn stale_lock_takeover_and_password_invalidation() {
 
     // alice's late checkin with her old token must NOT clobber bob's lock
     let form = reqwest::multipart::Form::new()
-        .text("client_id", "a")
-        .text("lock_token", alice_token)
         .part("snapshot", reqwest::multipart::Part::bytes(vec![1u8, 2, 3]).file_name("s.tgz"));
     let resp = c
         .post(format!("{}/envs/{env_id}/checkin", base(port)))
         .bearer_auth(&alice)
+        .header("x-client-id", "a")
+        .header("x-lock-token", alice_token)
         .multipart(form)
         .send()
         .await
@@ -444,4 +468,352 @@ async fn stale_lock_takeover_and_password_invalidation() {
     assert_eq!(resp.status().as_u16(), 401, "old token rejected after password change");
     // new password works
     let _ = token(&c, port, "alice", "pw2").await;
+}
+
+/// Snapshot download must present the current checkout's client_id + lock_token,
+/// not merely be the same user — a second/stale token can't pull the (plaintext)
+/// snapshot out from under the live session.
+#[tokio::test]
+async fn snapshot_download_requires_lock_token() {
+    let port = 38083u16;
+    let data = std::env::temp_dir().join(format!("shardx-e2e-dl-{}", std::process::id()));
+    let _guard = spawn_server(&data, port);
+    let c = client();
+    wait_health(&c, port).await;
+    let admin = token(&c, port, "admin", "secret").await;
+
+    // A member with `use` on an env.
+    c.post(format!("{}/users", base(port)))
+        .bearer_auth(&admin)
+        .json(&json!({ "username": "alice", "password": "pw" }))
+        .send()
+        .await
+        .unwrap();
+    let env: Value = c
+        .post(format!("{}/envs", base(port)))
+        .bearer_auth(&admin)
+        .json(&json!({ "name": "dl" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let env_id = env["id"].as_str().unwrap().to_string();
+    let users: Value = c
+        .get(format!("{}/users", base(port)))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let alice_id = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["username"] == "alice")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.post(format!("{}/acl", base(port)))
+        .bearer_auth(&admin)
+        .json(&json!({ "user_id": alice_id, "object_id": env_id, "object_kind": "env", "perm": "use" }))
+        .send()
+        .await
+        .unwrap();
+    let alice = token(&c, port, "alice", "pw").await;
+
+    // checkout(client a) → checkin (creates v1, releases lock).
+    let srcdir = data.join("dlsrc");
+    std::fs::create_dir_all(&srcdir).unwrap();
+    let snap = shardx_core::snapshot::pack(&srcdir).unwrap();
+    let v0: Value = c
+        .post(format!("{}/envs/{env_id}/checkout", base(port)))
+        .bearer_auth(&alice)
+        .json(&json!({ "client_id": "a" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let tok0 = v0["lock_token"].as_str().unwrap().to_string();
+    let form = reqwest::multipart::Form::new()
+        .part("snapshot", reqwest::multipart::Part::bytes(snap).file_name("s.tgz"));
+    let r = c
+        .post(format!("{}/envs/{env_id}/checkin", base(port)))
+        .bearer_auth(&alice)
+        .header("x-client-id", "a")
+        .header("x-lock-token", tok0)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "checkin creates v1");
+
+    // checkout(client a) again → alice holds the lock and v1 exists.
+    let v1: Value = c
+        .post(format!("{}/envs/{env_id}/checkout", base(port)))
+        .bearer_auth(&alice)
+        .json(&json!({ "client_id": "a" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let url = v1["snapshot_url"].as_str().expect("v1 snapshot").to_string();
+    let tok1 = v1["lock_token"].as_str().unwrap().to_string();
+
+    let get = |client_id: &str, lock_token: &str| {
+        c.get(format!("{}{}", base(port), url))
+            .bearer_auth(&alice)
+            .header("x-client-id", client_id.to_string())
+            .header("x-lock-token", lock_token.to_string())
+            .send()
+    };
+    // Correct session → 200.
+    assert_eq!(get("a", &tok1).await.unwrap().status().as_u16(), 200, "lock holder downloads");
+    // Same user, wrong client / wrong token / no headers → refused.
+    assert_eq!(get("b", &tok1).await.unwrap().status().as_u16(), 409, "other client refused");
+    assert_eq!(get("a", "wrong").await.unwrap().status().as_u16(), 409, "wrong token refused");
+    let none = c.get(format!("{}{}", base(port), url)).bearer_auth(&alice).send().await.unwrap();
+    assert_eq!(none.status().as_u16(), 409, "missing session headers refused");
+}
+
+/// A LIVE lock can only be re-acquired by presenting its current lock_token, so
+/// a second JWT for the same user can't learn the client_id, re-checkout, mint a
+/// fresh token, and steal the lock (which would also bypass the download check).
+#[tokio::test]
+async fn reacquiring_live_lock_requires_token() {
+    let port = 38084u16;
+    let data = std::env::temp_dir().join(format!("shardx-e2e-remint-{}", std::process::id()));
+    let _guard = spawn_server(&data, port);
+    let c = client();
+    wait_health(&c, port).await;
+    let admin = token(&c, port, "admin", "secret").await;
+
+    let env: Value = c
+        .post(format!("{}/envs", base(port)))
+        .bearer_auth(&admin)
+        .json(&json!({ "name": "remint" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let env_id = env["id"].as_str().unwrap().to_string();
+
+    let checkout = |tok: Option<&str>| {
+        let mut body = json!({ "client_id": "a" });
+        if let Some(t) = tok {
+            body["lock_token"] = json!(t);
+        }
+        c.post(format!("{}/envs/{env_id}/checkout", base(port)))
+            .bearer_auth(&admin)
+            .json(&body)
+            .send()
+    };
+
+    // First checkout on a free slot needs no token.
+    let v0: Value = checkout(None).await.unwrap().json().await.unwrap();
+    let tok = v0["lock_token"].as_str().unwrap().to_string();
+
+    // Re-acquiring the now-LIVE lock without / with a wrong token is refused.
+    assert_eq!(checkout(None).await.unwrap().status().as_u16(), 409, "no token can't reclaim live lock");
+    assert_eq!(checkout(Some("wrong")).await.unwrap().status().as_u16(), 409, "wrong token refused");
+    // With the real token it succeeds and rotates the token.
+    let v1: Value = checkout(Some(&tok)).await.unwrap().json().await.unwrap();
+    let tok2 = v1["lock_token"].as_str().unwrap().to_string();
+    assert_ne!(tok, tok2, "token rotates on re-acquire");
+    // The old token no longer works.
+    assert_eq!(checkout(Some(&tok)).await.unwrap().status().as_u16(), 409, "old token invalid after rotate");
+}
+
+/// Repeated failed logins from one source get throttled (429 with Retry-After)
+/// before any password verify — brute-force / Argon2 CPU-exhaustion guard.
+#[tokio::test]
+async fn login_throttles_after_repeated_failures() {
+    let port = 38085u16;
+    let data = std::env::temp_dir().join(format!("shardx-e2e-throttle-{}", std::process::id()));
+    let _guard = spawn_server(&data, port);
+    let c = client();
+    wait_health(&c, port).await;
+
+    let attempt = |password: &str| {
+        c.post(format!("{}/auth/login", base(port)))
+            .json(&json!({ "username": "admin", "password": password }))
+            .send()
+    };
+
+    // Five wrong-password attempts are plain 401s.
+    for _ in 0..5 {
+        assert_eq!(attempt("wrong").await.unwrap().status().as_u16(), 401);
+    }
+    // Now the source is locked: even the CORRECT password is refused with 429.
+    let r = attempt("secret").await.unwrap();
+    assert_eq!(r.status().as_u16(), 429, "locked out after repeated failures");
+    assert!(r.headers().get("retry-after").is_some(), "429 carries Retry-After");
+}
+
+/// A predictable client error (a foreign-key violation from a bogus folder_id)
+/// maps to 400, not a 500 leaking SQL / constraint text.
+#[tokio::test]
+async fn bad_foreign_key_is_client_error_not_500() {
+    let port = 38086u16;
+    let data = std::env::temp_dir().join(format!("shardx-e2e-fk-{}", std::process::id()));
+    let _guard = spawn_server(&data, port);
+    let c = client();
+    wait_health(&c, port).await;
+    let admin = token(&c, port, "admin", "secret").await;
+
+    let r = c
+        .post(format!("{}/envs", base(port)))
+        .bearer_auth(&admin)
+        .json(&json!({ "name": "x", "folder_id": "does-not-exist" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 400, "FK violation → 400, not 500");
+    let body: Value = r.json().await.unwrap();
+    let err = body["error"].as_str().unwrap_or_default().to_lowercase();
+    assert!(
+        !err.contains("foreign key") && !err.contains("sql") && !err.contains("constraint"),
+        "error message must not leak DB internals: {err}"
+    );
+}
+
+/// ACL grants against a nonexistent target or user are refused (no ghost rows).
+#[tokio::test]
+async fn acl_grant_rejects_ghost_target_or_user() {
+    let port = 38087u16;
+    let data = std::env::temp_dir().join(format!("shardx-e2e-ghost-{}", std::process::id()));
+    let _guard = spawn_server(&data, port);
+    let c = client();
+    wait_health(&c, port).await;
+    let admin = token(&c, port, "admin", "secret").await;
+
+    c.post(format!("{}/users", base(port)))
+        .bearer_auth(&admin)
+        .json(&json!({ "username": "alice", "password": "pw" }))
+        .send()
+        .await
+        .unwrap();
+    let users: Value = c
+        .get(format!("{}/users", base(port)))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let alice_id = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["username"] == "alice")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let grant = |user_id: &str, object_id: &str| {
+        c.post(format!("{}/acl", base(port)))
+            .bearer_auth(&admin)
+            .json(&json!({ "user_id": user_id, "object_id": object_id, "object_kind": "env", "perm": "use" }))
+            .send()
+    };
+    // Nonexistent env → 404.
+    assert_eq!(grant(&alice_id, "ghost-env").await.unwrap().status().as_u16(), 404);
+
+    let env: Value = c
+        .post(format!("{}/envs", base(port)))
+        .bearer_auth(&admin)
+        .json(&json!({ "name": "e" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let env_id = env["id"].as_str().unwrap().to_string();
+    // Nonexistent user → 404; a valid grant → success.
+    assert_eq!(grant("ghost-user", &env_id).await.unwrap().status().as_u16(), 404);
+    assert!(grant(&alice_id, &env_id).await.unwrap().status().is_success());
+}
+
+/// env update can clear folder_id to null, and rejects a nonexistent folder
+/// with 404 (not a 500/leaky FK error).
+#[tokio::test]
+async fn env_update_clears_folder_and_rejects_bad_folder() {
+    let port = 38088u16;
+    let data = std::env::temp_dir().join(format!("shardx-e2e-envupd-{}", std::process::id()));
+    let _guard = spawn_server(&data, port);
+    let c = client();
+    wait_health(&c, port).await;
+    let admin = token(&c, port, "admin", "secret").await;
+
+    let folder: Value = c
+        .post(format!("{}/folders", base(port)))
+        .bearer_auth(&admin)
+        .json(&json!({ "name": "F" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let folder_id = folder["id"].as_str().unwrap().to_string();
+    let env: Value = c
+        .post(format!("{}/envs", base(port)))
+        .bearer_auth(&admin)
+        .json(&json!({ "name": "e", "folder_id": folder_id }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let env_id = env["id"].as_str().unwrap().to_string();
+    assert_eq!(env["folder_id"].as_str(), Some(folder_id.as_str()));
+
+    let patch = |body: Value| {
+        c.patch(format!("{}/envs/{env_id}", base(port))).bearer_auth(&admin).json(&body).send()
+    };
+    // A nonexistent folder → 404.
+    assert_eq!(patch(json!({ "folder_id": "no-such" })).await.unwrap().status().as_u16(), 404);
+    // Clearing to null succeeds and the env is unfoldered.
+    let r = patch(json!({ "folder_id": Value::Null })).await.unwrap();
+    assert!(r.status().is_success(), "clear folder: {}", r.status());
+    let updated: Value = r.json().await.unwrap();
+    assert!(updated["folder_id"].is_null(), "folder_id cleared to null");
+}
+
+/// A malformed JSON body is rejected as the uniform { "error": ... } shape,
+/// not axum's default plain-text rejection.
+#[tokio::test]
+async fn malformed_json_body_returns_json_error() {
+    let port = 38089u16;
+    let data = std::env::temp_dir().join(format!("shardx-e2e-badjson-{}", std::process::id()));
+    let _guard = spawn_server(&data, port);
+    let c = client();
+    wait_health(&c, port).await;
+    let admin = token(&c, port, "admin", "secret").await;
+
+    let r = c
+        .post(format!("{}/users", base(port)))
+        .bearer_auth(&admin)
+        .header("content-type", "application/json")
+        .body("{ this is not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 400, "malformed body → 400");
+    let body: Value = r.json().await.expect("response is JSON");
+    assert!(body.get("error").and_then(|e| e.as_str()).is_some(), "has an error field: {body}");
 }

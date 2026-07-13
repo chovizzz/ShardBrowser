@@ -1,0 +1,424 @@
+openapi: 3.0.3
+
+info:
+  title: ShardX Team Server API
+  version: "0.1.0"
+  description: |
+    Self-hosted team server for shared ShardX environments: users/roles, ACLs,
+    exclusive checkout locks, and opaque snapshot blob storage. This is a
+    SEPARATE service from the launcher's local automation API (`../openapi.yaml`).
+
+    ## Auth
+    All routes except `GET /health` and `POST /auth/login` require
+    `Authorization: Bearer <token>` (HS256 JWT from login). The token carries the
+    user's role + a `token_version`; a password change bumps `token_version`,
+    invalidating every outstanding token. Admin-only routes return `403` for
+    members.
+
+    ## Permission model
+    - `admin` — full access to every route.
+    - `member` — access to an env/folder only via an ACL grant. `use` allows
+      launch/checkout; `edit` additionally allows editing content fields (moving
+      an env between folders or rebinding its proxy/host_os stays admin-only).
+      Folder grants apply recursively to descendants.
+
+    ## Checkout locks
+    `checkout` acquires a lease-based exclusive lock and returns a per-session
+    `lock_token` (plus the latest snapshot to pull). `lease` renews it; `checkin`
+    uploads a new snapshot and releases; `release` discards and unlocks. Every
+    lock-scoped call must present the `lock_token`; a live lock can only be
+    re-acquired by presenting the current one. `checkin` and snapshot download
+    take the session identity as the `x-client-id` + `x-lock-token` HEADERS (so
+    the server can authorize before reading the upload body / serving the blob).
+
+    ## Rate limiting
+    `POST /auth/login` is throttled per client IP and per username; over the
+    threshold it returns `429` with a `Retry-After` header.
+
+    ## Deployment
+    Binds `127.0.0.1:8080` by default; expose only behind a TLS reverse proxy.
+    On a non-loopback bind the server refuses to start with a weak/default admin
+    password. Set `SHARDX_TRUST_PROXY=1` (behind a header-sanitizing proxy) to
+    honor `X-Forwarded-For` for the login throttle.
+
+servers:
+  - url: http://127.0.0.1:8080
+    description: Default local bind (put HTTPS in front for production)
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    ClientIdHeader:
+      name: x-client-id
+      in: header
+      required: true
+      schema: { type: string }
+      description: The checkout session's client id.
+    LockTokenHeader:
+      name: x-lock-token
+      in: header
+      required: true
+      schema: { type: string }
+      description: The checkout session's lock_token (from `checkout`).
+    EnvId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string, description: Human-readable message. 5xx is always the generic "internal server error". }
+    LoginResponse:
+      type: object
+      properties:
+        token: { type: string }
+        role: { type: string, enum: [admin, member] }
+        user_id: { type: string }
+    CheckoutResponse:
+      type: object
+      properties:
+        env_id: { type: string }
+        client_id: { type: string }
+        lock_token: { type: string }
+        lease_expires_at: { type: string, format: date-time }
+        lease_ttl_secs: { type: integer }
+        version: { type: integer }
+        snapshot_url: { type: string, nullable: true, description: Present when version > 0. }
+        stale_takeover: { type: boolean }
+  responses:
+    Unauthorized: { description: Missing/invalid/expired token, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Forbidden: { description: Authenticated but not permitted (e.g. member on an admin route), content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    NotFound: { description: Target does not exist, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Conflict: { description: Lock held / stale token / duplicate, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    BadRequest: { description: Malformed or referencing a nonexistent resource, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+security:
+  - bearerAuth: []
+
+paths:
+  /health:
+    get:
+      summary: Liveness probe
+      security: []
+      responses: { '200': { description: OK } }
+
+  /auth/login:
+    post:
+      summary: Exchange username/password for a JWT (rate-limited)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties: { username: { type: string }, password: { type: string } }
+      responses:
+        '200': { description: Token issued, content: { application/json: { schema: { $ref: '#/components/schemas/LoginResponse' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { description: Too many attempts (see Retry-After header), headers: { Retry-After: { schema: { type: integer } } }, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /me:
+    get:
+      summary: Current identity
+      responses: { '200': { description: '{ id, username, role }' }, '401': { $ref: '#/components/responses/Unauthorized' } }
+  /me/password:
+    post:
+      summary: Change own password (verifies old; bumps token_version; returns a fresh token)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [old_password, new_password]
+              properties: { old_password: { type: string }, new_password: { type: string } }
+      responses: { '200': { description: '{ changed, token }' }, '400': { $ref: '#/components/responses/BadRequest' }, '401': { $ref: '#/components/responses/Unauthorized' } }
+
+  /users:
+    get:
+      summary: List users (admin)
+      responses: { '200': { description: User list }, '403': { $ref: '#/components/responses/Forbidden' } }
+    post:
+      summary: Create a user (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string }
+                role: { type: string, enum: [admin, member], default: member }
+      responses: { '200': { description: Created }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '409': { $ref: '#/components/responses/Conflict' } }
+  /users/{id}:
+    delete:
+      summary: Delete a user (admin)
+      parameters: [ { $ref: '#/components/parameters/EnvId' } ]
+      responses: { '200': { description: Deleted }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' } }
+  /users/{id}/role:
+    patch:
+      summary: Set a user's role (admin)
+      parameters: [ { $ref: '#/components/parameters/EnvId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [role], properties: { role: { type: string, enum: [admin, member] } } }
+      responses: { '200': { description: Updated }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' } }
+  /users/{id}/password:
+    patch:
+      summary: Admin reset of a user's password (invalidates their tokens)
+      parameters: [ { $ref: '#/components/parameters/EnvId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [password], properties: { password: { type: string } } }
+      responses: { '200': { description: Reset }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' } }
+
+  /audit:
+    get:
+      summary: Audit log (admin)
+      responses: { '200': { description: Recent audit entries }, '403': { $ref: '#/components/responses/Forbidden' } }
+
+  /folders:
+    get: { summary: List accessible folders, responses: { '200': { description: Folder list } } }
+    post:
+      summary: Create a folder (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [name], properties: { name: { type: string }, parent_id: { type: string, nullable: true } } }
+      responses: { '200': { description: Created }, '403': { $ref: '#/components/responses/Forbidden' } }
+  /folders/{id}:
+    patch:
+      summary: Rename / re-parent a folder (admin; rejects cycles)
+      parameters: [ { $ref: '#/components/parameters/EnvId' } ]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { name: { type: string }, parent_id: { type: string, nullable: true } } }
+      responses: { '200': { description: Updated }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' } }
+    delete:
+      summary: Delete a folder (admin)
+      parameters: [ { $ref: '#/components/parameters/EnvId' } ]
+      responses: { '200': { description: Deleted }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' } }
+
+  /envs:
+    get: { summary: List accessible environments, responses: { '200': { description: Env list (proxy credentials masked for members) } } }
+    post:
+      summary: Create an environment (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                folder_id: { type: string, nullable: true }
+                proxy_id: { type: string, nullable: true }
+                host_os: { type: string }
+                notes: { type: string }
+                config: { type: object, description: Fingerprint config blob. }
+      responses: { '200': { description: Created }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' } }
+  /envs/{id}:
+    get:
+      summary: Get one environment
+      parameters: [ { $ref: '#/components/parameters/EnvId' } ]
+      responses: { '200': { description: Env }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' } }
+    patch:
+      summary: Update an environment (edit-grant for content; admin for folder/proxy/host_os)
+      description: |
+        `folder_id` / `proxy_id` are nullable: omit to leave unchanged, send
+        `null` to clear, or a value to set (the target must exist → 404 if not).
+      parameters: [ { $ref: '#/components/parameters/EnvId' } ]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                folder_id: { type: string, nullable: true }
+                proxy_id: { type: string, nullable: true }
+                host_os: { type: string }
+                notes: { type: string }
+                config: { type: object }
+      responses: { '200': { description: Updated }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' } }
+    delete:
+      summary: Delete an environment (admin)
+      parameters: [ { $ref: '#/components/parameters/EnvId' } ]
+      responses: { '200': { description: Deleted }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' } }
+
+  /envs/{id}/checkout:
+    post:
+      summary: Acquire the exclusive lock + get the latest snapshot to pull
+      description: |
+        Acquires a leased lock and returns a `lock_token`. A free or expired lock
+        needs no token; re-acquiring a LIVE lock requires presenting its current
+        `lock_token` in the body.
+      parameters: [ { $ref: '#/components/parameters/EnvId' } ]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { client_id: { type: string }, lock_token: { type: string, description: Required only to re-acquire a live lock this client holds. } }
+      responses:
+        '200': { description: Locked, content: { application/json: { schema: { $ref: '#/components/schemas/CheckoutResponse' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: Held by someone else (or a live lock without its token), content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /envs/{id}/lease:
+    post:
+      summary: Renew the lease (presents lock_token; re-checks ACL)
+      parameters: [ { $ref: '#/components/parameters/EnvId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [lock_token]
+              properties: { client_id: { type: string }, lock_token: { type: string } }
+      responses: { '200': { description: '{ env_id, lease_expires_at, lease_ttl_secs }' }, '409': { $ref: '#/components/responses/Conflict' } }
+  /envs/{id}/checkin:
+    post:
+      summary: Upload a new snapshot and release the lock (multipart)
+      description: |
+        Identity is authorized from the `x-client-id` + `x-lock-token` headers
+        BEFORE the body is read; the `snapshot` part is streamed to disk. There
+        is no admin bypass — recovery is `force-unlock` + a fresh checkout.
+      parameters:
+        - { $ref: '#/components/parameters/EnvId' }
+        - { $ref: '#/components/parameters/ClientIdHeader' }
+        - { $ref: '#/components/parameters/LockTokenHeader' }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties: { snapshot: { type: string, format: binary } }
+      responses:
+        '200': { description: '{ version }' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { description: You no longer hold the lock, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '429': { description: Too many concurrent uploads (see Retry-After), headers: { Retry-After: { schema: { type: integer } } }, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /envs/{id}/release:
+    post:
+      summary: Discard local changes and unlock (presents lock_token)
+      parameters: [ { $ref: '#/components/parameters/EnvId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [lock_token]
+              properties: { client_id: { type: string }, lock_token: { type: string } }
+      responses: { '200': { description: Released }, '409': { $ref: '#/components/responses/Conflict' } }
+  /envs/{id}/force-unlock:
+    post:
+      summary: Admin — clear a stuck lock regardless of owner
+      parameters: [ { $ref: '#/components/parameters/EnvId' } ]
+      responses: { '200': { description: Unlocked }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' } }
+  /envs/{id}/lock:
+    get:
+      summary: Current lock status
+      parameters: [ { $ref: '#/components/parameters/EnvId' } ]
+      responses: { '200': { description: '{ locked, owner_*, lease_expires_at, expired, held_by_me }' }, '403': { $ref: '#/components/responses/Forbidden' } }
+  /envs/{id}/snapshot/{version}:
+    get:
+      summary: Download a snapshot blob (raw bytes)
+      description: |
+        Snapshots carry plaintext session state (cookies, payment secrets), so
+        download is limited to the current lock holder (via `x-client-id` +
+        `x-lock-token`) or an admin. Response carries `x-snapshot-sha256`.
+      parameters:
+        - { $ref: '#/components/parameters/EnvId' }
+        - { name: version, in: path, required: true, schema: { type: integer } }
+        - name: x-client-id
+          in: header
+          required: false
+          schema: { type: string }
+          description: Required for members / the lock holder; an admin may omit it (break-glass).
+        - name: x-lock-token
+          in: header
+          required: false
+          schema: { type: string }
+          description: Required for members / the lock holder; an admin may omit it (break-glass).
+      responses:
+        '200': { description: Blob, headers: { x-snapshot-sha256: { schema: { type: string } } }, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Not the lock holder, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /acl:
+    post:
+      summary: Grant a user use/edit on an env or folder (admin)
+      description: The user and target must exist (else 404) — no ghost grants.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id, object_id, object_kind]
+              properties:
+                user_id: { type: string }
+                object_id: { type: string }
+                object_kind: { type: string, enum: [env, folder] }
+                perm: { type: string, enum: [use, edit], default: use }
+      responses: { '200': { description: Granted }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' } }
+    delete:
+      summary: Revoke a grant (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id, object_id, object_kind]
+              properties:
+                user_id: { type: string }
+                object_id: { type: string }
+                object_kind: { type: string, enum: [env, folder] }
+      responses: { '200': { description: Revoked }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' } }
+
+  /proxies:
+    get: { summary: List proxies (credentials masked for members), responses: { '200': { description: Proxy list } } }
+    post:
+      summary: Create a proxy (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, kind, host, port]
+              properties:
+                name: { type: string }
+                kind: { type: string }
+                host: { type: string }
+                port: { type: integer }
+                username: { type: string }
+                password: { type: string }
+      responses: { '200': { description: Created }, '403': { $ref: '#/components/responses/Forbidden' } }
+  /proxies/{id}:
+    delete:
+      summary: Delete a proxy (admin)
+      parameters: [ { $ref: '#/components/parameters/EnvId' } ]
+      responses: { '200': { description: Deleted }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' } }

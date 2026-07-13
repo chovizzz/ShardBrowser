@@ -16,7 +16,7 @@ launcher 之外新增一个**自建中心服务器**:集中存放环境配置 + 
 |---|---|---|
 | Phase 1 | `server/` 骨架:用户/角色/登录、env/folder/proxy CRUD、ACL | ✅ 验收+回归 |
 | Phase 2 | 独占借出锁(checkout/lease/checkin/release/force-unlock)+ 快照 blob + 保留 GC | ✅ 验收+回归 |
-| Phase 3 | `shared/`(`shardx-core`):os_crypt v10 加解密 + 跨机重加密 + 快照打包(排缓存) | ✅ 9/9 单测 |
+| Phase 3 | `shared/`(`shardx-core`):os_crypt v10 加解密 + 跨机重加密(Cookies/Web Data/Login Data)+ 快照打包(排缓存) | ✅ 33 单测 |
 | Phase 4 | 启动器接入:`sync.rs`(pull/push/lease)、launch/退出钩子、`remote_*` 命令、`App.tsx` Team 视图 | ✅ build + e2e |
 | Phase 5 | TeamView 占用状态展示 + 管理员 Force-unlock、文档收尾 | ✅ build 门禁 |
 | 加固 | 安全审查后修复：ACL perm 强制 + folder 递归、代理凭据脱敏、锁 token/原子性、改密码+审计+token 失效、pull/push 恢复+sha256 校验 | ✅ 3 e2e 回归 |
@@ -90,19 +90,26 @@ reqwest multipart + `shardx_core` 跑通 checkout→checkin→download→unpack,
 | Linux | AES-128-CBC | `peanuts` 固定口令 | mac/linux 间可移植 |
 | Windows | AES-256-GCM | **DPAPI**(绑用户+机器)解出的 key | ❌ 任意机器间都不通用 |
 
-**统一方案:快照里不存加密后的 Cookies/Login Data 文件,只存可移植的明文值。**
+**统一方案(已落地于 `shardx-core`):快照里的加密数据一律在 pack 时用源机 key 解密成
+可移植明文、在 unpack 时用目标机 key 重新封装。** 具体分两种落地形态:
 
-- **checkin**:用 `cookies::export`(已实现,内部解密为明文 `Cookie` 结构)→ 写
-  `snapshot/cookies.json`;`Login Data`(保存的密码)同理(需给 `cookies.rs` 补
-  Login Data 表的解密)→ `snapshot/logins.json`。其余非加密目录原样打包。
-- **checkout**:解压目录后,用 `cookies::import`(已实现)按**本机密钥**重新加密
-  写回本地 `Cookies` DB;`logins.json` 同理写回 `Login Data`。
+- **Cookies —「排除原库 + 明文重建」**:pack 排除 `Cookies` DB,把每条 cookie 解密进
+  `shardx-portable.json` 的 `cookies`(含 CHIPS `top_frame_site_key` 等唯一键分量);
+  unpack 用本机 key 从明文**重建**整个 Cookies DB(`cookies::write`)。
+- **Web Data(卡号/CVC/IBAN)与 Login Data(保存的密码)—「原库随行 + 就地重封装」**:
+  原始 SQLite DB 连同 `-wal`/`-shm` 随快照旅行;pack 只把加密列(`card_number_encrypted` /
+  `password_value`)解密进 portable state,unpack 用本机 key **就地** UPDATE 回那几列
+  (Web Data 按 `guid`、Login Data 按 SQLite `rowid` 定位),其余版本相关列原样保留,
+  最后 `wal_checkpoint(TRUNCATE)` 使落地 DB 自包含。**账号绑定的 `Login Data For Account`
+  (及其 `-wal`/`-shm`)不随行**——目标机从登录的 Google 账号重新同步。
 
-这样 mac→win / win→mac / win-A→win-B 全走同一路径,无需判断源/目标 OS。
+两种形态 mac→win / win→mac / win-A→win-B 全走同一路径,无需判断源/目标 OS。所有加密列均为
+os_crypt v10 secret 方案(`LocalCrypt::{encrypt,decrypt}_secret`,无 host 前缀);解密失败
+**fail-closed**(拒绝 pack),绝不把空值封回去覆盖真实数据。
 
-> 实现注意:`cookies::import` 需确认能在不存在 Cookies DB 时新建;`cookies.rs`
-> 当前只处理 `cookies` 表,需扩展同样的 per-OS 加解密到 `Login Data` 的 `logins` 表
-> (`password_value` blob 与 cookie 的 `encrypted_value` 用同一 os_crypt 方案)。
+> 状态:Cookies / Web Data / Login Data 三条路径均已实现并单测覆盖(`shared/src/{cookies,
+> webdata,logins}.rs` + `snapshot.rs` 端到端)。launcher 侧手动 cookie 导入导出也已委托
+> `shardx-core`(`src-tauri/src/cookies.rs`),不再维护第二份 os_crypt 实现。
 
 ---
 
@@ -111,8 +118,10 @@ reqwest multipart + `shardx_core` 跑通 checkout→checkin→download→unpack,
 同一环境同一时刻只允许一人运行,否则并发登录会让登录态互相覆盖、触发风控。
 
 **租约式锁(防客户端崩溃死锁)**
-- `checkout` 原子加锁,返回带 TTL 的租约(默认 90s)+ 最新快照版本/下载地址。
-- 客户端运行期间每 30s 调 `/lease` 续租。
+- `checkout` 原子加锁,返回带 TTL 的租约(默认 90s,服务端最小 15s)+ 最新快照
+  版本/下载地址;响应含 `lease_ttl_secs` 供客户端计算续租节奏。
+- 客户端在续租响应里读到 TTL,按 ~TTL/3 调 `/lease` 续租(而非固定间隔),覆盖
+  pull 下载/解包、浏览器运行、push 打包上传全程,使短 TTL 也不会在续租前过期。
 - 客户端崩溃 → 租约到期 → 管理员可 `force-unlock`,或自动回收;回收时环境标记
   "可能有未提交改动",由原借出方确认。
 - `checkin` 上传新快照 → version+1 → 释放锁;`release` 丢弃改动并释放锁。
@@ -191,6 +200,21 @@ checkin 不会互相覆盖。撤销 ACL 会立即中断续租/归还（这些操
 单 Docker 容器,挂载一个数据卷(`./data`)。配置走环境变量:监听地址、
 Token 签名密钥、存储路径、(可选)S3 端点。
 
+**登录限速**:`/auth/login` 有指数退避锁定——按客户端 IP(阈值 5)和用户名(阈值 15,更宽
+松以免合法用户被 lockout DoS)分别计数,达阈值前置返回 429 + `Retry-After`(在 DB 查询/Argon2
+之前);另有全局信号量封顶并发 Argon2 验证数,挡并发首波 CPU 耗尽。客户端 IP 默认取真实 peer
+socket(不可伪造);`SHARDX_TRUST_PROXY=1` 时才信 `X-Forwarded-For`/`X-Real-IP`(需 IP 格式合法)——
+**仅当反代会覆盖入站该头且禁止直连时才可开**,否则客户端可伪造头绕过 per-IP 限速。状态进程内(重启即清)。
+
+**安全默认**:裸机默认 `SHARDX_BIND=127.0.0.1:8080`(仅本机可达);Docker 镜像设为
+`0.0.0.0:8080`(经端口映射/反代暴露)。一旦 bind 非 loopback,服务器对**弱口令 admin
+拒绝启动**:① 首次 bootstrap 时口令为空/过短(<8)/占位符(admin、secret、change-me…)即
+`bail`;② 即使库里已有 admin(早先用 admin/admin 建过、或先 loopback 后改暴露),也会逐个
+对现有 admin 的 hash 校验占位符口令,命中即拒(已改强口令的放行;hash 无法还原长度,故只测
+占位符)。必须设强 `SHARDX_ADMIN_PASS`(并建议设 `SHARDX_TOKEN_SECRET` 让 token 跨重启
+有效)。确需暴露端口用弱口令(内网临时测试)可设 `SHARDX_ALLOW_INSECURE_ADMIN=1` 豁免。
+loopback bind 只告警不阻断。
+
 ---
 
 ## 5. 客户端改造(增量,不破坏单机模式)
@@ -222,23 +246,49 @@ Token 签名密钥、存储路径、(可选)S3 端点。
 
 ## 7. 已知风险 / 待定
 
-- **快照含明文 cookie（威胁模型）**:快照为跨机可移植,内部存的是**解密后的明文 cookie**
-  (§2.1)。因此“能下载某环境快照”≈“能离线导出该环境登录态”。已把下载收紧为**仅当前
-  持锁方或 admin**,并写审计;但持锁期间导出无法从协议层阻止。部署须假设有权 use 某环境
-  的成员即可获得其登录态——按此分配 ACL。若需更强隔离,后续可对快照做服务端信封加密
-  (仅按需下发)或改为端到端加密。
+- **客户端凭据落盘(0600,非加密)**:launcher 把 team-server bearer token(`settings.json`)、
+  每 profile 的 checkout `lock_token`(profile JSON)、代理凭据(`proxies.json`)、ProxyShard
+  billing key(`psapi.json`)明文存在配置目录,写入时经 `store::write_private` 设 Unix `0600`
+  (Windows 靠 `%APPDATA%` per-user ACL)。这只挡**同机其他用户读取**——不加密,且备份/云同步工具
+  可能不保留 POSIX mode,凭据仍可能随备份外泄。高价值场景可后续改用系统 keychain/Credential
+  Manager。`remote_logout` 清 token、`discard` 清 lock_token。
+- **快照含明文敏感数据（威胁模型，明确可信边界）**:快照为跨机可移植,portable state 里存的是
+  **解密后的明文**;`Web Data` / `Login Data` 的原库虽随快照旅行,但其加密列在 pack 时也被解密进
+  portable state。覆盖面:cookie(含会话/鉴权 token)、`Web Data` 支付/自动填充(信用卡号、CVC、
+  IBAN)、**`Login Data` 保存的密码**(见 §2.1 与 `logins.rs`/`webdata.rs`)。因此“能下载某环境
+  快照”≈“能离线导出该环境的全部登录态、支付信息**与保存的密码**”;且**服务端把 blob 存为普通
+  文件、保留的历史快照会保留旧密码**。
+  **明确的可信边界(部署前提)**:凡有权 use 某环境(持锁成员 / admin)、或能读到 server 主机磁盘 /
+  备份的人,即视为有权获得该环境的上述全部凭据。请据此分配 ACL,并把快照磁盘、备份、server 管理员
+  纳入可信边界。已把下载收紧为**仅当前持锁方或 admin**并写审计,但持锁期间的导出无法从协议层阻止。
+  **上线前加固项**(尚未实现):① 生产**强制** HTTPS(当前仅客户端告警,见下条);② server 端信封
+  加密快照 blob(仅按需下发);③ 若连 server 管理员也不应见明文,则需端到端加密(而非仅信封)。
 - **传输安全(TLS)**:登录密码、JWT、代理凭据、快照明文都走 HTTP。**生产必须在反代后启用
   HTTPS**。客户端已加明文告警:`sync::insecure_transport_warning` 检测非 loopback 的 `http://`,
   TeamView 在用户输入服务器地址时实时红字提示,登录成功后再 toast 一次(`remote_transport_warning`
   命令 + `remote_login` 响应的 `insecure_transport` 字段)。https 或 localhost/127.0.0.1/::1 不告警。
-- **Login Data(保存的密码)不纳入首版**:多数站点登录态在 cookie 里。`Login Data` 用机器
-  绑定密钥加密、跨机不可移植,快照**排除**它(`snapshot.rs` EXCLUDE 列表),`PortableState.logins`
-  留空。如需纳入,须像 cookie 一样解密成明文再于目标机重建。
+- **Login Data(保存的密码)跨机归一化(已完成)**:与 `Web Data` 同一「原库随行 + 就地重封装」
+  路径。`Login Data` 原 SQLite(连同 `-wal`/`-shm`)随快照打包;`logins.rs` 在 pack 时用源机 key
+  解密 `password_value` 进 `PortableState.logins`(按 SQLite `rowid` 定位,不依赖 Chromium 版本
+  相关的复合唯一键,天然处理同 realm+用户名多行),unpack 时按 rowid **就地用目标机 key 重加密**
+  该列、其余列原样保留,再 `wal_checkpoint(TRUNCATE)` 折叠进主库。每条必须恰好 UPDATE 1 行,否则
+  报错并不交换 staging(避免留下半重封装、不可解的 DB)。空密码行(如用户拉黑站点)跳过;非空 blob
+  解密失败 **fail-closed** 拒绝 pack。账号绑定的 `Login Data For Account`(及 `-wal`/`-shm`)**不
+  随行**,目标机从登录账号重新同步。敏感面见上条威胁模型。
 - **unpack 原子化(已完成)**:快照先解到同级 `<id>.incoming` 暂存目录、在其中重建 Cookies,
   成功后再 rename 交换进 `user-data/<id>/`(旧目录先移到 `<id>.backup`,二次 rename 失败会回滚)。
   失败/崩溃只留下可被下次清理的暂存目录,现有 udd 不受影响;全量替换同时清除了远端已删除的
-  本地残留文件。交换时**保留本机 `Local State`**(机器绑定的 os_crypt key),避免用新 key 覆盖
-  后本机已加密的 Web Data(自动填充)失效——Windows 上关键,macOS/Linux 上 key 固定故为空操作。
+  本地残留文件。交换时**保留本机 `Local State`**(机器绑定的 os_crypt key)。
+- **Web Data(支付/自动填充)跨机归一化(已完成)**:`Web Data` 原 SQLite 随快照打包,但其
+  加密列(`credit_cards.card_number_encrypted`、`local_stored_cvc`/`local_ibans` 的
+  `value_encrypted`)用源机 key 加密、跨机不可解。`webdata.rs` 在 pack 时用源机 key 解密进
+  `PortableState.web_secrets`,unpack 时按行 `guid` **就地用目标机 key 重加密**(不重建整个
+  多表 schema),重加密后 best-effort `wal_checkpoint(TRUNCATE)` 把结果折叠进主库(正确性不依赖
+  它:即便 checkpoint 失败,后写入的目标 key frame 仍在 WAL 里、目标引擎读到的也是新值)(SQLite
+  `-wal`/`-shm` 随快照保留,以免硬杀 checkin 时未 checkpoint 的已提交行丢失)。仅覆盖**本地、
+  guid 键**的支付数据;账号/服务器绑定项(`unmasked_credit_cards`、
+  `server_stored_cvc`、`token_service`)登录后由账号重新同步,故不纳入。解不出的行跳过(残留孤儿,
+  无害)。
 - **快照体积**:若某些环境 IndexedDB 很大,可在 Phase 2 后引入增量/分块(内容寻址)
   降低上传量;首版用整包压缩。
 - **跨 OS 指纹一致性**:一个环境的指纹固定声明某个 OS;成员在不同 host OS 上运行同一

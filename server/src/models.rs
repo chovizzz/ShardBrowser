@@ -166,14 +166,27 @@ pub struct CreateEnvReq {
     pub config: Option<Value>,
 }
 
+/// serde helper distinguishing "field absent" from "field present as null".
+/// With `#[serde(default, deserialize_with = "double_option")]`: absent → `None`
+/// (leave unchanged), `null` → `Some(None)` (clear), value → `Some(Some(v))`.
+pub fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    serde::Deserialize::deserialize(de).map(Some)
+}
+
 #[derive(Deserialize)]
 pub struct UpdateEnvReq {
     #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
-    pub folder_id: Option<String>,
-    #[serde(default)]
-    pub proxy_id: Option<String>,
+    // Nullable so an env can be moved out of a folder / unbound from a proxy:
+    // absent = leave, null = clear, value = set.
+    #[serde(default, deserialize_with = "double_option")]
+    pub folder_id: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub proxy_id: Option<Option<String>>,
     #[serde(default)]
     pub host_os: Option<String>,
     #[serde(default)]
@@ -201,7 +214,9 @@ pub struct RevokeReq {
 /// Identifies the holding session so two sessions of the same user don't
 /// silently share a lock. Optional; defaults to "default" server-side.
 /// `lock_token` is the secret returned by checkout — required for
-/// lease/release (and checkin, where it travels as a multipart field).
+/// checkout-reclaim/lease/release. (checkin/download take these two as
+/// `x-client-id` / `x-lock-token` headers instead, so identity is checked
+/// before the request body is read.)
 #[derive(Deserialize, Default)]
 pub struct ClientReq {
     #[serde(default)]

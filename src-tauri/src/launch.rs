@@ -81,6 +81,16 @@ pub async fn launch_profile(
         }
     }
 
+    // Hold the checkout lease across launch preflight. The proxy UDP probe and
+    // geo/auto-field resolution below are network calls that can take seconds,
+    // and the browser-side renewer only starts once the engine spawns — without
+    // this a short lease TTL could lapse mid-preflight and let a peer steal the
+    // lock. Lives until this function returns, overlapping the renewer handover.
+    let _preflight_lease = remote_env_id
+        .as_deref()
+        .filter(|_| crate::sync::is_configured())
+        .map(|env_id| crate::sync::LeaseGuard::start(profile_id, env_id));
+
     // Stored proxy by id, else ephemeral inline (quick profiles, not in store).
     let bound_proxy: Option<proxy::ProxyEntry> = stored
         .meta

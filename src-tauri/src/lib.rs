@@ -404,6 +404,21 @@ pub fn save_profile_core(
 
     let mut stored: profile::StoredProfile =
         serde_json::from_value(payload).map_err(|e| e.to_string())?;
+    // The remote checkout binding (env id, lock token, base version, pending
+    // push) is owned by the launch/sync pipeline, NOT the profile editor. A
+    // generic UI save omits these fields, and serde's `default` would reset them
+    // to None/false — silently unlinking a checked-out profile, discarding a
+    // pending push, and stranding its server lock until lease expiry. Re-read the
+    // persisted values and carry them over on every save of an existing profile;
+    // a deliberate unlink goes through the dedicated remote command, not here.
+    if !is_new {
+        if let Ok(existing) = profile::load_raw(&stored.meta.id) {
+            stored.meta.remote_env_id = existing.meta.remote_env_id;
+            stored.meta.remote_lock_token = existing.meta.remote_lock_token;
+            stored.meta.remote_base_version = existing.meta.remote_base_version;
+            stored.meta.remote_pending_push = existing.meta.remote_pending_push;
+        }
+    }
     profile::save_raw(&mut stored).map_err(|e| e.to_string())?;
     let name = stored
         .config
@@ -456,6 +471,12 @@ fn profile_import(payloads: Vec<Value>) -> Result<usize, String> {
             match obj.get_mut("_meta").and_then(|m| m.as_object_mut()) {
                 Some(meta) => {
                     meta.insert("id".into(), Value::String(String::new()));
+                    // An imported profile is a fresh local one — never inherit a
+                    // remote binding or checkout session from the payload, or the
+                    // import could reuse someone's lock_token.
+                    for k in ["remote_env_id", "remote_lock_token", "remote_base_version", "remote_pending_push"] {
+                        meta.remove(k);
+                    }
                 }
                 None => {
                     obj.insert("_meta".into(), serde_json::json!({ "id": "" }));
@@ -814,7 +835,8 @@ fn cookies_export(profile_id: String) -> Result<Vec<cookies::Cookie>, String> {
 fn cookies_export_to_file(profile_id: String, path: String) -> Result<usize, String> {
     let cookies = cookies::export(&profile_id).map_err(|e| e.to_string())?;
     let json = serde_json::to_string_pretty(&cookies).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    // Plaintext cookies — write owner-only by default (the user can widen it).
+    store::write_private(std::path::Path::new(&path), json).map_err(|e| e.to_string())?;
     Ok(cookies.len())
 }
 

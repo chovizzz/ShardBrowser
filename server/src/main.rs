@@ -4,7 +4,9 @@ mod blob;
 mod config;
 mod db;
 mod error;
+mod extract;
 mod models;
+mod ratelimit;
 mod routes;
 mod state;
 mod util;
@@ -36,10 +38,14 @@ async fn main() -> anyhow::Result<()> {
     }
     let pool = db::init_pool(&cfg).await?;
     db::bootstrap_admin(&pool, &cfg).await?;
+    blob::gc_orphans(&cfg, &pool).await;
 
     let state = AppState {
         db: pool,
         cfg: cfg.clone(),
+        login_throttle: std::sync::Arc::new(ratelimit::LoginThrottle::new()),
+        upload_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+        download_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
     };
     // No CORS layer on purpose: the only client is the desktop launcher
     // (reqwest, no Origin). Browser-origin access stays blocked by default.
@@ -48,7 +54,9 @@ async fn main() -> anyhow::Result<()> {
     let addr = SocketAddr::from_str(&cfg.bind)?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("ShardX Team Server listening on http://{addr}");
-    axum::serve(listener, app)
+    // `into_make_service_with_connect_info` so handlers can read the peer IP
+    // (the login throttle keys on it).
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())

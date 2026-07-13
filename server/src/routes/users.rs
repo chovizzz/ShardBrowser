@@ -2,6 +2,7 @@ use axum::extract::{Path, State};
 use axum::Json;
 use serde_json::{json, Value};
 
+use crate::extract::AppJson;
 use crate::auth::{self, AuthUser};
 use crate::audit;
 use crate::error::AppError;
@@ -23,7 +24,7 @@ pub async fn list(
 pub async fn create(
     State(app): State<AppState>,
     user: AuthUser,
-    Json(req): Json<CreateUserReq>,
+    AppJson(req): AppJson<CreateUserReq>,
 ) -> Result<Json<Value>, AppError> {
     user.require_admin()?;
     let role = match req.role.as_deref() {
@@ -34,7 +35,7 @@ pub async fn create(
     if req.username.trim().is_empty() || req.password.is_empty() {
         return Err(AppError::BadRequest("username and password required".into()));
     }
-    let hash = auth::hash_password(&req.password)?;
+    let hash = auth::hash_slot(&app, req.password).await?;
     let id = util::new_id();
     let res = sqlx::query(
         "INSERT INTO users (id, username, pw_hash, role, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -84,13 +85,13 @@ pub async fn reset_password(
     State(app): State<AppState>,
     user: AuthUser,
     Path(id): Path<String>,
-    Json(req): Json<ResetPasswordReq>,
+    AppJson(req): AppJson<ResetPasswordReq>,
 ) -> Result<Json<Value>, AppError> {
     user.require_admin()?;
     if req.password.is_empty() {
         return Err(AppError::BadRequest("password required".into()));
     }
-    let hash = auth::hash_password(&req.password)?;
+    let hash = auth::hash_slot(&app, req.password).await?;
     let res = sqlx::query(
         "UPDATE users SET pw_hash = ?, token_version = token_version + 1 WHERE id = ?",
     )
@@ -109,7 +110,7 @@ pub async fn set_role(
     State(app): State<AppState>,
     user: AuthUser,
     Path(id): Path<String>,
-    Json(req): Json<SetRoleReq>,
+    AppJson(req): AppJson<SetRoleReq>,
 ) -> Result<Json<Value>, AppError> {
     user.require_admin()?;
     if req.role != "admin" && req.role != "member" {
