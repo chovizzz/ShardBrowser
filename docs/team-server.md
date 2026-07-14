@@ -264,9 +264,12 @@ loopback bind 只告警不阻断。
   **上线前加固项**(尚未实现):① 生产**强制** HTTPS(当前仅客户端告警,见下条);② server 端信封
   加密快照 blob(仅按需下发);③ 若连 server 管理员也不应见明文,则需端到端加密(而非仅信封)。
 - **传输安全(TLS)**:登录密码、JWT、代理凭据、快照明文都走 HTTP。**生产必须在反代后启用
-  HTTPS**。客户端已加明文告警:`sync::insecure_transport_warning` 检测非 loopback 的 `http://`,
-  TeamView 在用户输入服务器地址时实时红字提示,登录成功后再 toast 一次(`remote_transport_warning`
-  命令 + `remote_login` 响应的 `insecure_transport` 字段)。https 或 localhost/127.0.0.1/::1 不告警。
+  HTTPS**。开箱即用的部署栈见 [`deploy/`](../deploy/):docker-compose 把 server 跑在 Caddy
+  后面自动签发/续期 Let's Encrypt 证书,server 不发布端口、置于 `internal: true` 内网,只经
+  Caddy 到达(`SHARDX_TRUST_PROXY=1` 在此安全:Caddy 会剥掉客户端伪造的 XFF)。客户端已加明文
+  告警:`sync::insecure_transport_warning` 检测非 loopback 的 `http://`,TeamView 在用户输入
+  服务器地址时实时红字提示,登录成功后再 toast 一次(`remote_transport_warning` 命令 +
+  `remote_login` 响应的 `insecure_transport` 字段)。https 或 localhost/127.0.0.1/::1 不告警。
 - **Login Data(保存的密码)跨机归一化(已完成)**:与 `Web Data` 同一「原库随行 + 就地重封装」
   路径。`Login Data` 原 SQLite(连同 `-wal`/`-shm`)随快照打包;`logins.rs` 在 pack 时用源机 key
   解密 `password_value` 进 `PortableState.logins`(按 SQLite `rowid` 定位,不依赖 Chromium 版本

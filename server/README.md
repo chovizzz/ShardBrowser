@@ -25,6 +25,18 @@ docker run -p 8080:8080 -v "$PWD/data:/data" \
   shardx-team-server
 ```
 
+The `docker run` above publishes plain HTTP — fine for a private/loopback test,
+but for a real remote deployment use the **[`deploy/`](../deploy/) stack**: it
+runs the server behind Caddy with automatic HTTPS (Let's Encrypt), and leaves
+the server unpublished on an internal-only network. Snapshots carry decrypted
+cookies / saved passwords / card numbers, so cross-machine traffic must be
+encrypted. One-command deploy:
+
+```bash
+cd deploy && cp .env.example .env   # set domain + secrets, then:
+docker compose up -d --build
+```
+
 Config is all environment variables — see [`.env.example`](.env.example).
 SQLite DB + snapshot blobs live under `SHARDX_DATA_DIR` (`/data` in Docker).
 On first start with an empty user table, an admin is bootstrapped from
