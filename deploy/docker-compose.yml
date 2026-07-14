@@ -1,0 +1,69 @@
+# ShardX Team Server behind Caddy with automatic HTTPS (Let's Encrypt).
+#
+# Only Caddy is published (80/443); the team server listens on an INTERNAL
+# compose network and is reachable ONLY through Caddy. That isolation is what
+# makes SHARDX_TRUST_PROXY=1 safe: the server trusts X-Forwarded-For for its
+# per-IP login throttle, and here (a) there is no direct path to the server that
+# could inject a forged header, and (b) Caddy — with no `trusted_proxies`
+# configured — ignores any client-supplied X-Forwarded-For and sets it to the
+# real client IP. Publishing the server's port directly would break both.
+#
+#   cp .env.example .env   # then fill it in
+#   docker compose up -d --build
+
+services:
+  server:
+    build:
+      context: ../server
+    restart: unless-stopped
+    environment:
+      SHARDX_TOKEN_SECRET: ${SHARDX_TOKEN_SECRET:?set a long random value in .env}
+      SHARDX_ADMIN_USER: ${SHARDX_ADMIN_USER:-admin}
+      SHARDX_ADMIN_PASS: ${SHARDX_ADMIN_PASS:?set a strong admin password in .env}
+      # Safe only because the server is unpublished and Caddy strips inbound XFF
+      # (see the header comment). Do NOT set this if you publish 8080 directly.
+      SHARDX_TRUST_PROXY: "1"
+      # SHARDX_BIND (0.0.0.0:8080) and SHARDX_DATA_DIR (/data) come from the image.
+      # Optional tuning — uncomment to override the defaults:
+      # SHARDX_TOKEN_TTL_SECS: "604800"     # token lifetime (7d)
+      # SHARDX_LEASE_TTL_SECS: "90"         # checkout lease TTL
+      # SHARDX_SNAPSHOT_KEEP: "10"          # snapshots retained per env
+      # SHARDX_MAX_SNAPSHOT_BYTES: "536870912"  # 512 MiB checkin cap
+    volumes:
+      - shardx-data:/data
+    expose:
+      - "8080"          # internal to the compose network — NOT published
+    networks:
+      - backend         # backend is `internal: true` → no host port, no internet
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - server
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    environment:
+      SHARDX_DOMAIN: ${SHARDX_DOMAIN:?set your public domain in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data      # ACME account + issued certs — MUST persist
+      - caddy-config:/config
+    networks:
+      - frontend        # external: published ports + outbound ACME to Let's Encrypt
+      - backend         # reach the server over the isolated internal network
+
+networks:
+  # Only Caddy sits on `frontend`; `backend` is internet-isolated so the server
+  # can neither reach out nor be reached except through Caddy. The server makes
+  # no outbound calls (local SQLite + local blobs), so isolation costs it nothing.
+  frontend:
+  backend:
+    internal: true
+
+volumes:
+  shardx-data:
+  caddy-data:
+  caddy-config:
