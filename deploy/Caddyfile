@@ -1,0 +1,13 @@
+# Automatic HTTPS for the team server. {$SHARDX_DOMAIN} is taken from the
+# environment (set in .env, passed through by docker compose). Caddy provisions
+# and auto-renews a Let's Encrypt certificate for it, so before starting:
+#   * the domain's public DNS A/AAAA record must point at this host, and
+#   * ports 80 and 443 must be reachable from the internet (ACME HTTP/TLS-ALPN).
+#
+# No `trusted_proxies` is configured on purpose: Caddy is the edge here, so it
+# ignores any client-supplied X-Forwarded-For and sets it to the real client IP
+# — which is exactly what the server's per-IP login throttle (SHARDX_TRUST_PROXY=1)
+# depends on. Only add `trusted_proxies` if you put ANOTHER proxy in front of Caddy.
+{$SHARDX_DOMAIN} {
+	reverse_proxy server:8080
+}

@@ -1,0 +1,2 @@
+# Real secrets — never commit. Only .env.example is tracked.
+.env
