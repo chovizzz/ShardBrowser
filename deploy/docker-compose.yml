@@ -14,7 +14,10 @@
 services:
   server:
     build:
-      context: ../server
+      # Repo root — the server crate's dev-dependency on ../shared must be in
+      # the build context (see server/Dockerfile).
+      context: ..
+      dockerfile: server/Dockerfile
     restart: unless-stopped
     environment:
       SHARDX_TOKEN_SECRET: ${SHARDX_TOKEN_SECRET:?set a long random value in .env}

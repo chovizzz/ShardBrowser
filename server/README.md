@@ -17,8 +17,9 @@ cd server
 SHARDX_TOKEN_SECRET=dev-secret SHARDX_ADMIN_PASS=dev-strong-pass cargo run
 
 # docker (binds 0.0.0.0 → network-facing, so a strong admin password is REQUIRED;
-# a weak/placeholder one makes first start refuse to boot)
-docker build -t shardx-team-server server/
+# a weak/placeholder one makes first start refuse to boot). Build from the REPO
+# ROOT with -f: the image needs the sibling `shared` crate too, not just server/.
+docker build -f server/Dockerfile -t shardx-team-server .
 docker run -p 8080:8080 -v "$PWD/data:/data" \
   -e SHARDX_TOKEN_SECRET=$(openssl rand -hex 32) \
   -e SHARDX_ADMIN_USER=admin -e SHARDX_ADMIN_PASS="$(openssl rand -base64 18)" \

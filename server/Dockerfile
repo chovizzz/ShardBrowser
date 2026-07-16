@@ -1,10 +1,18 @@
 # ---- build ----
+# NOTE: the build context is the REPO ROOT, not server/. The server crate has a
+# dev-dependency on ../shared (shardx-core), which cargo resolves even for a
+# release build, so both crates must be in the context. Build with:
+#   docker build -f server/Dockerfile -t shardx-team-server .
+# (docker compose in deploy/ already sets the context + dockerfile for you.)
 FROM rust:1-bookworm AS build
 WORKDIR /app
-COPY Cargo.toml ./
-COPY migrations ./migrations
-COPY src ./src
-RUN cargo build --release
+# `shardx-core` is referenced as ../shared → resolves to /shared from this WORKDIR.
+COPY shared /shared
+COPY server/Cargo.toml server/Cargo.lock ./
+COPY server/migrations ./migrations
+COPY server/src ./src
+# --locked: build the exact committed Cargo.lock, never silently re-resolve.
+RUN cargo build --release --locked
 
 # ---- runtime ----
 FROM debian:bookworm-slim
