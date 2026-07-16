@@ -1,0 +1,9 @@
+# The team-server image (server/Dockerfile) builds from the repo root but needs
+# only the `server` and `shared` crates. Exclude everything else — especially the
+# multi-GB Rust target dirs and node_modules — so the build context stays small.
+*
+!server
+!shared
+# ...but never the crates' local build output.
+server/target
+shared/target
