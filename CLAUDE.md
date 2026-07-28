@@ -95,7 +95,13 @@ team server** for multi-user shared environments with exclusive checkout locks. 
 - `server/` — standalone axum + SQLite crate (`shardx-team-server`): users/roles/JWT auth,
   env/folder/proxy CRUD, per-user ACL, checkout locks (lease-based), and opaque snapshot
   blob storage. Self-contained (not in a workspace with `src-tauri`); `cargo run` / Docker.
-  Integration test: `server/tests/e2e_sync.rs`.
+  Integration tests: `e2e_sync.rs` (checkout→checkin→download roundtrip), `e2e_acl.rs`
+  (ACL grant/revoke validation), `e2e_locks_concurrent.rs` (lock races + soft-lease).
+  **The checkout lease is soft**: expiry only makes a lock *reclaimable*, it does not
+  invalidate the holder's token — a lapsed-renewer client still holds the only copy of
+  the un-pushed data. Do not "fix" this by adding a `lease_expires_at` predicate to
+  `lease`/`checkin`/`release`; it is deliberate and documented in all four contracts
+  (`locks.rs` module docs, `openapi.yaml`, `server/README.md`, `docs/team-server.md`).
 - `shared/` — `shardx-core` crate (no Tauri dep): Chromium `os_crypt` v10 cookie/secret
   encryption with the key handled explicitly (so cookies re-encrypt across machines, incl.
   Mac↔Windows), and portable `user-data-dir` snapshot pack/unpack (excludes cache + the
@@ -107,6 +113,24 @@ team server** for multi-user shared environments with exclusive checkout locks. 
 
 Note `cookies.rs` (existing) and `shared/src/cookies.rs` currently both implement the
 os_crypt scheme — a future cleanup is to have `src-tauri` delegate to `shardx-core`.
+
+## Fleet / mobile ("cloud phone") — design only, NOT implemented
+
+`docs/fleet.md` is the current design draft for a second capability line: a self-hosted farm
+of **real** ARM Android devices, driven over USB/ADB from rack-side agents, for running
+native apps with team-shared exclusive checkout. **No Fleet-specific code exists yet** (the
+existing `server/`, ACL, and audit machinery it builds on does), and it is gated on a
+physical spike (§8 Phase −1) that must pass before any control-plane code is written.
+
+The draft deliberately keeps two boundaries, both with reasoning recorded in the doc:
+mobile gets its own domain model and a separate `FleetView` rather than a `kind` on
+`ProfileMeta`/`StoredProfile` (§2.3); and device locks live in their own table with hard
+leases + fencing epochs rather than generalising `locks`, because env locks are soft-lease
+in practice (§4). Don't casually merge either boundary — but they are design decisions, not
+axioms: change them by updating `docs/fleet.md` and resolving the invariants it lists.
+
+The doc's appendix records pre-existing `server/` concerns surfaced by that review. It is a
+point-in-time snapshot — **re-verify against the code before acting on any entry**.
 
 ## Conventions & gotchas
 
