@@ -30,16 +30,34 @@ pub async fn grant(
     // the ACL row is a ghost that never applies and just lingers. Do it as one
     // atomic statement (existence gated by `EXISTS` in the same INSERT) so a
     // concurrent target delete can't slip a ghost row in between a check and the
-    // write. `object_kind` is validated above, so the table name is a fixed
-    // choice, not user input; ids/perm are bound.
-    let table = if req.object_kind == "env" { "environments" } else { "folders" };
-    let res = sqlx::query(&format!(
-        "INSERT INTO acl (user_id, object_id, object_kind, perm) \
-         SELECT ?1, ?2, ?3, ?4 \
-         WHERE EXISTS (SELECT 1 FROM {table} WHERE id = ?2) \
-           AND EXISTS (SELECT 1 FROM users WHERE id = ?1) \
-         ON CONFLICT(user_id, object_id, object_kind) DO UPDATE SET perm = excluded.perm",
-    ))
+    // write. ids/perm are bound.
+    //
+    // The two statements are spelled out in full rather than interpolating a
+    // table name: the only part that varies is which table `EXISTS` probes, and
+    // an exhaustive `match` over the validated kinds keeps every byte of SQL a
+    // `&'static str`. That is also what sqlx 0.9's `SqlSafeStr` requires, so a
+    // future kind cannot be added without either writing its statement here or
+    // failing to compile — which is the point.
+    macro_rules! grant_sql {
+        ($target:literal) => {
+            concat!(
+                "INSERT INTO acl (user_id, object_id, object_kind, perm) \
+                 SELECT ?1, ?2, ?3, ?4 \
+                 WHERE EXISTS (SELECT 1 FROM ",
+                $target,
+                " WHERE id = ?2) \
+                   AND EXISTS (SELECT 1 FROM users WHERE id = ?1) \
+                 ON CONFLICT(user_id, object_id, object_kind) DO UPDATE SET perm = excluded.perm",
+            )
+        };
+    }
+    let sql: &'static str = match req.object_kind.as_str() {
+        "env" => grant_sql!("environments"),
+        "folder" => grant_sql!("folders"),
+        // Unreachable: `valid_kind` above admits exactly these two.
+        other => return Err(AppError::BadRequest(format!("invalid object_kind: {other}"))),
+    };
+    let res = sqlx::query(sql)
     .bind(&req.user_id)
     .bind(&req.object_id)
     .bind(&req.object_kind)
