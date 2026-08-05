@@ -122,11 +122,14 @@ which `busy_timeout` is no substitute. Plan it as downtime.
 > write/checkpoint concurrently (fixed in 3.51.3, backported to 3.50.7 /
 > 3.44.6). This server opens up to **8 connections**, squarely in the affected
 > pattern. The version the server links against is on the startup `INFO` line,
-> and the bundled `libsqlite3-sys` currently compiles an older amalgamation than
-> any of those. If the server's SQLite is affected, **do not enable WAL** —
-> upgrade the SQLite the server links against first. Verify the *migration
-> tool's* SQLite separately (`sqlite3 --version`): both it and the server
-> runtime must be safe, and they are not the same build.
+> and the startup warning states outright whether it satisfies this prerequisite.
+> As shipped it does: `libsqlite3-sys` is pinned high enough to bundle 3.51.3.
+> If you change that pin, or build against a system SQLite, re-check the line.
+> If the server's SQLite is affected, **do not enable WAL** — upgrade it first.
+> Verify the *migration tool's* SQLite separately (`sqlite3 --version`): both it
+> and the server runtime must be safe, and they are not the same build. (macOS
+> currently ships 3.51.0 in `/usr/bin/sqlite3`, which is *not* safe — one common
+> way to get this wrong.)
 >
 > Calibrate the urgency: upstream describes this bug as needing very tight
 > timing, says they could not reproduce it organically (it took deliberately
