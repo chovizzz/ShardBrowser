@@ -72,6 +72,11 @@ pub async fn revoke(
     AppJson(req): AppJson<RevokeReq>,
 ) -> Result<Json<Value>, AppError> {
     user.require_admin()?;
+    // Same gate as `grant` — one rule for what an ACL kind may be, so a value
+    // the grant path would have refused can never be used to probe/delete here.
+    if !valid_kind(&req.object_kind) {
+        return Err(AppError::BadRequest("object_kind must be env|folder".into()));
+    }
     let res = sqlx::query("DELETE FROM acl WHERE user_id = ? AND object_id = ? AND object_kind = ?")
         .bind(&req.user_id)
         .bind(&req.object_id)

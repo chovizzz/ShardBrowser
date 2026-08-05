@@ -84,6 +84,86 @@ can `force-unlock`. The server stores snapshot blobs opaquely (the launcher
 packs/encrypts them) and keeps the last `SHARDX_SNAPSHOT_KEEP` (default 5)
 versions, GC'ing older blobs.
 
+**The lease is soft.** Expiry only makes the lock *reclaimable* — it does not by
+itself invalidate the holder's `lock_token`. `checkout` is the only route where
+`lease_expires_at` can change who owns the lock, and only to decide whether
+someone else may take the slot over (`GET /envs/:id/lock` also reads it, but
+just to report the `expired` flag). Until a takeover actually happens, a session
+whose lease lapsed (laptop slept, renewer wedged, network blip) can still
+`lease`, `checkin`, `release`, and download its snapshot normally. The token
+dies only when the lock row is **replaced** (a new checkout, including the same
+client's, which rotates the token) or **deleted** (`checkin`, `release`,
+`force-unlock`).
+
+This is deliberate: a client that merely lost its renewer still holds the only
+copy of the un-pushed environment data, and rejecting its `checkin` would throw
+that work away even though nobody else ever claimed the lock. Ownership is the
+exact `user + client_id + lock_token` tuple, and the access-gated routes
+(`lease`, `checkin`, snapshot download) re-check ACL on every call — so revoking
+a user's grant ends their session regardless of the token. `release` skips that
+check on purpose, so a holder can always hand the lock back.
+
+### Database journal mode (WAL)
+
+The server does not set `journal_mode`; a database created by recent sqlx runs
+on SQLite's default rollback journal, where a reader and a writer block each
+other. (WAL would not lift SQLite's single-writer limit — it stops readers and
+the writer from serializing against each other.) On startup the server reads
+`PRAGMA main.journal_mode` and `sqlite_version()` and logs both at `INFO` on
+every start. It additionally **warns** when the mode isn't `wal` — or, louder,
+when the DB *is* on WAL under a SQLite that predates the fix below. It never
+changes the mode automatically: WAL is the one journal mode that sticks to the
+database file (the rollback modes are
+per-connection defaults), and switching into it needs exclusive access, for
+which `busy_timeout` is no substitute. Plan it as downtime.
+
+> **Prerequisite — settle this before anything else.** SQLite had a WAL-reset
+> concurrency bug that can corrupt a WAL database when several connections
+> write/checkpoint concurrently (fixed in 3.51.3, backported to 3.50.7 /
+> 3.44.6). This server opens up to **8 connections**, squarely in the affected
+> pattern. The version the server links against is on the startup `INFO` line,
+> and the bundled `libsqlite3-sys` currently compiles an older amalgamation than
+> any of those. If the server's SQLite is affected, **do not enable WAL** —
+> upgrade the SQLite the server links against first. Verify the *migration
+> tool's* SQLite separately (`sqlite3 --version`): both it and the server
+> runtime must be safe, and they are not the same build.
+>
+> Calibrate the urgency: upstream describes this bug as needing very tight
+> timing, says they could not reproduce it organically (it took deliberately
+> injected test logic), and puts the observed rate on par with SSD malfunctions
+> or cosmic-ray bit flips. So an existing WAL deployment on an affected SQLite
+> warrants a high-priority maintenance window, but not a same-hour scramble:
+> do not switch without a backup, a version-checked SQLite, and exclusive
+> access to the database. Rushing past those three is how you turn a rare
+> corruption risk into a certain one.
+
+Migration procedure, once the version prerequisite is satisfied:
+
+1. Stop **every** server instance and any other process touching the database.
+2. Take a full backup: the main DB file plus any existing `-wal` (it can hold
+   committed transactions not yet checkpointed into the main file). The `-shm`
+   is a rebuildable index, not a source of durable data — copying it is
+   harmless but it is not what you are protecting.
+3. Run `PRAGMA journal_mode=WAL;` from a `sqlite3` CLI you have version-checked
+   above. The Docker image ships only the server binary and no `sqlite3`, so
+   run it from the host or a one-off container against the mounted data volume.
+4. **Check the returned value.** This PRAGMA reports the resulting mode and
+   returns the *old* mode if the switch did not take (e.g. a lingering lock).
+   Anything other than `wal` means it did not happen — do not assume success
+   from a clean exit code.
+5. Restart the service and confirm the startup log no longer emits the
+   journal-mode warning.
+6. **Do not enable WAL if the database lives on a network filesystem** (NFS,
+   SMB, most container network volumes). WAL needs shared-memory locking
+   between processes on one host; remote filesystems do not provide it safely.
+
+To go the other way — the server warns that an existing DB is already on WAL
+under an affected SQLite — the procedure is the same in reverse: stop every
+process using the database, back it up (including the `-wal`), run
+`PRAGMA journal_mode=DELETE;` with a version-checked `sqlite3`, and confirm the
+statement returned `delete`. SQLite checkpoints the WAL into the main file as
+part of the switch, so the stop-everything step is what protects the data.
+
 ### Access model
 
 A member sees an environment if they have a direct `env` grant **or** a grant on

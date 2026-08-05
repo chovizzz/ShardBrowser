@@ -23,8 +23,104 @@ pub async fn init_pool(cfg: &Config) -> anyhow::Result<SqlitePool> {
         .connect_with(opts)
         .await?;
 
+    // `journal_mode` is a persistent property of the database FILE, so reading it
+    // through any pooled connection reports the whole DB's state. sqlx no longer
+    // sends a journal_mode pragma by default, which means a freshly created DB
+    // runs on SQLite's rollback journal, where a reader and a writer block each
+    // other. (WAL is the one mode that sticks to the file; the rollback modes are
+    // per-connection defaults, which is why only WAL can be observed here as a
+    // property of the DB rather than of our own connect options.) We only observe
+    // and warn: switching into WAL needs exclusive access, which `busy_timeout` is
+    // no substitute for, so it belongs in a planned downtime window and not in a
+    // server about to start serving. Failing to read either pragma is fatal —
+    // running migrations against a database we can't even interrogate isn't worth
+    // the risk.
+    let journal_mode: String = sqlx::query_scalar("PRAGMA main.journal_mode")
+        .fetch_one(&pool)
+        .await?;
+    let sqlite_version: String = sqlx::query_scalar("SELECT sqlite_version()")
+        .fetch_one(&pool)
+        .await?;
+    let is_wal = journal_mode.trim().eq_ignore_ascii_case("wal");
+    let wal_safe = has_wal_reset_fix(&sqlite_version);
+    // Always state both, so the healthy case is still auditable from the log
+    // (the README points operators here to identify the linked SQLite).
+    tracing::info!("SQLite {sqlite_version}, journal_mode '{journal_mode}' ({})", cfg.db_path);
+    if is_wal && !wal_safe {
+        // The dangerous combination, and the reason the version is logged at all:
+        // this SQLite predates the WAL-reset fix, and we open several connections
+        // that write and checkpoint concurrently — exactly the pattern that can
+        // corrupt a WAL database. Louder than the "not WAL" case below.
+        tracing::warn!(
+            "SQLite {} is running {} in WAL mode but predates the WAL-reset corruption fix \
+             (3.51.3, backported to 3.50.7 / 3.44.6). This server opens up to 8 connections, \
+             which is the affected concurrent write/checkpoint pattern. Upgrade the SQLite \
+             this binary links against, or stop every user of the database and move it back \
+             off WAL with a version-checked SQLite tool. Upstream rates the bug as very \
+             rare (they could not reproduce it without injected test logic), so plan this \
+             properly rather than as an emergency. See \"Database journal mode (WAL)\" \
+             in server/README.md.",
+            sqlite_version,
+            cfg.db_path
+        );
+    } else if !is_wal {
+        tracing::warn!(
+            // Deliberately phrased for any non-WAL mode: `delete`/`truncate`/`persist`
+            // are rollback journals, but `off` has no journal at all (and no crash
+            // recovery — called out separately below).
+            "SQLite journal_mode is '{}' (not WAL) for {} — WAL's reader/writer concurrency \
+             is unavailable in this mode, so a reader and a writer serialize against each \
+             other (WAL would not lift the single-writer limit either).{} The server does \
+             NOT change this automatically: unlike the rollback modes, WAL is a persistent \
+             property of the database file, and switching into it needs exclusive access. \
+             Running SQLite {}. See \"Database \
+             journal mode (WAL)\" in server/README.md for the offline procedure — including \
+             the SQLite version prerequisite, which this runtime does{} satisfy.",
+            journal_mode,
+            cfg.db_path,
+            if journal_mode.trim().eq_ignore_ascii_case("off") {
+                " journal_mode=off ALSO disables rollback entirely: a crash mid-transaction \
+                 can leave the database corrupt and unrecoverable."
+            } else {
+                ""
+            },
+            sqlite_version,
+            if wal_safe { "" } else { " NOT" }
+        );
+    }
+
     sqlx::migrate!("./migrations").run(&pool).await?;
     Ok(pool)
+}
+
+/// Does this SQLite carry the fix for the WAL-reset concurrency bug that can
+/// corrupt a WAL database when several connections write/checkpoint at once?
+///
+/// Fixed in 3.51.3, backported to the 3.50.x and 3.44.x branches (3.50.7 /
+/// 3.44.6). Anything older on those branches — or any other branch at or below
+/// 3.51.2 — must not be considered safe for WAL. (Pre-3.7.0 lands here too;
+/// WAL did not exist before 3.7.0, so it is unaffected rather than vulnerable,
+/// but it is equally not something to enable WAL on.) An unparseable version is
+/// treated as unsafe: we'd rather warn about a runtime we can't identify than
+/// stay quiet about it.
+fn has_wal_reset_fix(version: &str) -> bool {
+    let mut parts = version.trim().split('.').map(|p| {
+        p.split(|c: char| !c.is_ascii_digit()).next().unwrap_or("").parse::<u32>()
+    });
+    let (Some(Ok(major)), Some(Ok(minor)), Some(Ok(patch))) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    match (major, minor) {
+        (3, 51) => patch >= 3,
+        (3, 50) => patch >= 7,
+        (3, 44) => patch >= 6,
+        // Any branch newer than 3.51 carries the fix; everything older than the
+        // three patched branches (and the unpatched tails of 3.45..=3.49) does not.
+        (3, m) => m > 51,
+        (m, _) => m > 3,
+    }
 }
 
 /// On an empty DB, create the initial admin from config.
@@ -136,6 +232,19 @@ pub async fn find_user_by_name(pool: &SqlitePool, name: &str) -> Result<Option<U
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wal_reset_fix_detection() {
+        // Patched: the fix release and both backport branches, plus anything newer.
+        for ok in ["3.51.3", "3.51.4", "3.52.0", "3.50.7", "3.50.9", "3.44.6", "4.0.0"] {
+            assert!(has_wal_reset_fix(ok), "{ok} should be considered patched");
+        }
+        // Affected: pre-fix tails of the patched branches, unpatched branches in
+        // between, the version currently bundled, and anything we can't parse.
+        for bad in ["3.51.2", "3.50.6", "3.44.5", "3.46.0", "3.49.9", "3.7.0", "", "unknown"] {
+            assert!(!has_wal_reset_fix(bad), "{bad} should be considered affected");
+        }
+    }
 
     #[test]
     fn weak_password_detection() {

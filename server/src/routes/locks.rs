@@ -3,9 +3,34 @@
 //! Flow: `checkout` acquires a leased lock and returns a per-session
 //! `lock_token` plus the latest snapshot to pull; the client renews with
 //! `lease` while the browser runs; `checkin` uploads the new snapshot and
-//! releases the lock; `release` discards and unlocks. Every lock operation
-//! must present the token, so a stale session (crash, expired lease, lock
-//! reclaimed by someone else) can no longer touch the environment.
+//! releases the lock; `release` discards and unlocks. Ownership on the
+//! session-bound routes is decided by the exact tuple
+//! `env_id + owner_user_id + owner_client_id + lock_token` — nothing else.
+//! (`checkout` on a free/expired slot, `status`, admin `force-unlock` and
+//! admin snapshot `download` are by design not session-bound.)
+//!
+//! The lease is deliberately **soft**:
+//!
+//! * Expiry only makes the lock **reclaimable** — `checkout` is the only
+//!   route that lets `lease_expires_at` change who owns the lock, and only
+//!   to hand a lapsed slot to the next taker. (`status` also reads it, but
+//!   purely to report an `expired` flag.)
+//! * Until a takeover actually happens, the current `lock_token` stays
+//!   **valid**: a holder whose lease lapsed (laptop asleep, renewer wedged,
+//!   network blip) can still `lease`, `checkin` its work, `release`, or
+//!   `download` the snapshot. Ownership is still subject to the other checks
+//!   each route performs — `lease`, `checkin` and `download` re-read ACL
+//!   access, so a revoked grant ends the session even while the token
+//!   matches (`release` deliberately skips that, so a holder can always hand
+//!   the lock back).
+//! * A token only dies once the lock row is **replaced** (someone else's
+//!   checkout, or our own re-checkout, which rotates the token) or
+//!   **deleted** (`checkin`, `release`, admin `force-unlock`).
+//!
+//! That asymmetry is intentional. A hard expiry check on the write paths
+//! would strand a client that merely lost the renewer: it holds the only
+//! copy of the un-pushed `user-data-dir`, and refusing its `checkin` would
+//! throw that work away even though nobody else ever claimed the lock.
 //! `force-unlock` (admin) clears a stuck lock.
 
 use axum::extract::{Multipart, Path, State};
@@ -58,6 +83,12 @@ async fn load_lock(app: &AppState, env_id: &str) -> Result<Option<Lock>, AppErro
 /// Non-atomic check that this exact session (user + client + non-empty token)
 /// currently owns the lock. Used to reject a request before reading an upload
 /// body; the operation's own conditional SQL remains the atomic authority.
+///
+/// `lease_expires_at` is intentionally NOT part of the predicate — see the
+/// module docs on the soft lease. A lapsed-but-unclaimed lease still belongs
+/// to its holder; only a replaced or deleted row revokes the token. Don't
+/// "fix" this by adding an expiry term. Shared by the `checkin` pre-check and
+/// non-admin snapshot `download`, so both inherit the soft-lease semantics.
 async fn session_holds_lock(
     app: &AppState,
     env_id: &str,
@@ -259,6 +290,10 @@ pub async fn checkout(
 }
 
 /// Renew the lease. Must present the current session's lock_token.
+///
+/// The UPDATE matches on identity + token only, never on `lease_expires_at`:
+/// renewing an already-lapsed lease is allowed as long as nobody reclaimed the
+/// slot in the meantime (soft lease — see the module docs). Intentional.
 pub async fn lease(
     State(app): State<AppState>,
     user: AuthUser,
@@ -282,7 +317,7 @@ pub async fn lease(
     .await?;
     if res.rows_affected() == 0 {
         return Err(AppError::Conflict(
-            "you no longer hold this lock (expired, taken over, or bad token)".into(),
+            "this session no longer holds the lock (taken over, unlocked, or bad token)".into(),
         ));
     }
     Ok(Json(json!({
@@ -298,6 +333,12 @@ pub async fn lease(
 /// non-holder can't make us buffer a large upload. Requires the checkout
 /// session's lock_token; there is no admin bypass (recovery is force-unlock +
 /// a fresh checkout).
+///
+/// Neither the pre-check nor the atomic DELETE looks at `lease_expires_at`.
+/// That is deliberate (soft lease — see the module docs): a client whose lease
+/// lapsed still holds the only copy of the packed `user-data-dir`, so as long
+/// as nobody reclaimed the slot we accept its snapshot rather than discard the
+/// work. Do not add an expiry term here.
 pub async fn checkin(
     State(app): State<AppState>,
     user: AuthUser,
@@ -320,7 +361,7 @@ pub async fn checkin(
     // authority). An empty token can never match.
     if token.is_empty() || !session_holds_lock(&app, &id, &user.id, &client, &token).await? {
         return Err(AppError::Conflict(
-            "you no longer hold this lock (expired, taken over, or bad token)".into(),
+            "this session no longer holds the lock (taken over, unlocked, or bad token)".into(),
         ));
     }
 
@@ -366,7 +407,7 @@ pub async fn checkin(
         if del.rows_affected() != 1 {
             tx.rollback().await?;
             return Err(AppError::Conflict(
-                "you no longer hold this lock (expired, taken over, or bad token)".into(),
+                "this session no longer holds the lock (taken over, unlocked, or bad token)".into(),
             ));
         }
         let cur: i64 =
@@ -431,6 +472,9 @@ pub async fn checkin(
 
 /// Release the lock without uploading (discard local changes). Requires the
 /// session's lock_token; admins use force-unlock instead.
+///
+/// As with `lease`/`checkin`, expiry is intentionally not checked (soft lease —
+/// see the module docs): an unclaimed lock is still ours to hand back cleanly.
 pub async fn release(
     State(app): State<AppState>,
     user: AuthUser,
@@ -450,7 +494,7 @@ pub async fn release(
     .await?;
     if res.rows_affected() == 0 {
         return Err(AppError::Conflict(
-            "you no longer hold this lock (expired, taken over, or bad token)".into(),
+            "this session no longer holds the lock (taken over, unlocked, or bad token)".into(),
         ));
     }
     audit::log(&app.db, Some(&user.id), "release", Some(&id), &client).await;

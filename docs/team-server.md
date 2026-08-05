@@ -191,9 +191,16 @@ GET  /envs/{id}/snapshot/{version} → 仅当前持锁方或 admin 可下载；�
 
 **锁与会话安全**：`checkout` 用单条条件 upsert 原子抢锁（无 read-then-write 窗口），只在
 无锁 / 已过期 / 同 owner 时成功；返回一次性 `lock_token`，后续 lease/checkin/release 全部
-校验它——崩溃或被接管的旧会话无法再写。`checkin` 在事务内做条件删锁（owner+client+token），
+校验它——**锁被别人接管（token 已轮换）之后**，旧会话再也写不进去。注意仅仅"崩溃"或
+"租约过期"并不使 token 失效，见下方软租约说明。`checkin` 在事务内做条件删锁（owner+client+token），
 `rows_affected != 1` 即冲突；快照先写临时 blob，事务定版后再 rename 到最终路径，两个并发
-checkin 不会互相覆盖。撤销 ACL 会立即中断续租/归还（这些操作重跑 `load_accessible`）。
+checkin 不会互相覆盖。撤销 ACL 会立即中断 `lease`/`checkin`/非管理员快照下载（这些操作
+重跑 `load_accessible`）；`release` **有意不查 ACL**，好让被撤权的持有者始终能把锁交回。
+
+> **租约是软的**：过期本身不会使 `lock_token` 失效，只是让锁**可被抢占**。在真正发生
+> takeover 之前，租约已过期的会话仍可正常 `lease`/`checkin`/`release`。token 只在锁行被
+> **替换**（新 checkout，含同一客户端自己的，会轮换 token）或**删除**（checkin/release/
+> force-unlock）时才失效。这是有意为之——续租器掉线的客户端手上是未推送环境数据的唯一副本。
 
 ### 4.3 部署
 

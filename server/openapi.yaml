@@ -31,6 +31,15 @@ info:
     take the session identity as the `x-client-id` + `x-lock-token` HEADERS (so
     the server can authorize before reading the upload body / serving the blob).
 
+    **The lease is soft.** A lapsed `lease_expires_at` only makes the lock
+    *reclaimable* — it does not by itself invalidate the holder's `lock_token`.
+    Until another session actually checks the lock out, the original holder can
+    still `lease`, `checkin`, `release`, and download its snapshot. The token
+    stops working only once the lock row is replaced (any new checkout, which
+    rotates the token) or deleted (`checkin`/`release`/`force-unlock`). This is
+    deliberate: a client whose renewer merely lapsed still holds the only copy
+    of the un-pushed environment data.
+
     ## Rate limiting
     `POST /auth/login` is throttled per client IP and per username; over the
     threshold it returns `429` with a `Retry-After` header.
@@ -396,7 +405,7 @@ paths:
                 user_id: { type: string }
                 object_id: { type: string }
                 object_kind: { type: string, enum: [env, folder] }
-      responses: { '200': { description: Revoked }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' } }
+      responses: { '200': { description: Revoked }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' } }
 
   /proxies:
     get: { summary: List proxies (credentials masked for members), responses: { '200': { description: Proxy list } } }
