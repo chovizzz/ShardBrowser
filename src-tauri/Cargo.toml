@@ -47,7 +47,7 @@ jsonwebtoken = "9"
 # MCP bootstrap: download the server tarball from GitHub + extract.
 flate2 = "1"
 tar = "0.4"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 pbkdf2 = "0.12"

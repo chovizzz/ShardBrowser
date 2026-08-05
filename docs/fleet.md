@@ -475,6 +475,9 @@ Android 的 Wi-Fi MAC 随机化会影响单纯按 MAC 绑定，需管理"每网�
 **"控制面一行不写"的准确含义**：不写将来要长期维护的 server / launcher 代码。
 Spike **允许且应当**写一次性的 Rack harness、脚本和抓包工具——否则无法完成验证。
 
+> 📋 **可执行版本见 `docs/fleet-phase-minus-1-runbook.md`** —— 变量表、对照组矩阵、
+> 量化门槛、pass/fail 判据、证据清单、签字页，可直接照着执行。以下是要点摘要。
+
 **开工前必须先固定一张验证矩阵**（否则本节不可执行）：
 
 - **固定变量**：设备型号、Android 版本、目标 App 版本、账号样本、AP / USB hub / 电源型号、代理供应商。
@@ -593,7 +596,7 @@ Profile 与 Fleet 的统一搜索/首页；对外 SDK；MCP 的设备 UI 自动�
 
 | 问题 | 位置 | 状态 |
 |---|---|---|
-| 初始化不启用/不校验 WAL | `server/src/db.rs` | ✅ **已处理** — 启动时读 `PRAGMA main.journal_mode` + `sqlite_version()` 并告警，**不自动切换**；停机迁移步骤见 `server/README.md`。<br>⚠️ **遗留**：bundled `libsqlite3-sys 0.30.1` 编译的是 SQLite 3.46.0，落在 WAL-reset 损坏 bug 影响区间（3.7.0–3.51.2，修复 3.51.3 / backport 3.50.7 / 3.44.6）。**启用 WAL 前必须先升级该依赖**——这一项无人认领 |
+| 初始化不启用/不校验 WAL | `server/src/db.rs` | ✅ **已处理** — 启动时读 `PRAGMA main.journal_mode` + `sqlite_version()` 并告警，**不自动切换**；停机迁移步骤见 `server/README.md`。<br>✅ 前置依赖也已解决：原先 bundled 的是 SQLite 3.46.0，落在 WAL-reset 损坏 bug 影响区间（3.7.0–3.51.2）；现已升到 **3.51.3**（修复版本），启动告警会明确告知是否满足该前置条件 |
 | `revoke()` 缺 `valid_kind()` | `server/src/routes/acl.rs` | ✅ **已修** — 补校验（在 `require_admin()` 之后），`openapi.yaml` 同步 400，回归测试见 `server/tests/e2e_acl.rs` |
 | 锁测试无并发用例 | `server/tests/` | ✅ **已补** — `server/tests/e2e_locks_concurrent.rs`，5 个测试 |
 | 租约过期后仍可 lease/checkin/release，与模块注释声明的意图不符 | `locks.rs:273/358/443` | ✅ **已固化为软租约**（改注释 + 4 处错误文案 + 补测试），**行为未改**——改行为有数据丢失风险。契约已同步到 `openapi.yaml`、`server/README.md`、`docs/team-server.md` |

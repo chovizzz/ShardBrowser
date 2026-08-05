@@ -28,12 +28,22 @@ npm run dev            # frontend-only Vite (rarely useful alone — needs the R
 npm run build          # tsc typecheck + vite build (no Tauri)
 ```
 
-Rust backend (run from `src-tauri/`):
+Rust backend (run from `src-tauri/`, and separately from `server/` and `shared/`):
 ```bash
 cargo build            # or cargo check for a fast compile check
-cargo fmt
-cargo clippy
+cargo clippy           # currently clean — keep it that way
 ```
+
+**Do not run `cargo fmt`.** This codebase is hand-formatted (~100 cols) and has never
+been through rustfmt: `cargo fmt --check` reports 120+ diffs in `src-tauri/` and 126 in
+`server/` on an untouched tree. Running it would bury whatever you changed under a
+whole-repo reformat. There is no `rustfmt.toml` because no setting reproduces the existing
+style — `max_width` of 100/110/120 all still leave 100+ diffs per crate, so a config
+cannot be used to make `cargo fmt` safe here. Match the surrounding style by hand.
+
+Adopting rustfmt is a real option, but it is a deliberate one-off decision — a
+formatting-only commit plus a `.git-blame-ignore-revs` — not something to do as a side
+effect of another change, and not while branches are in flight.
 
 There is no automated test suite in this repo; verification is manual via the running app
 or the live HTTP API. The README's `cd rust/shardx-launcher` is stale — the repo root *is*
